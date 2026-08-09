@@ -2,12 +2,17 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use image::{ImageReader, Rgb, RgbImage};
 use pixel_pusher::{
+    cell_warp::{CellWarpOptions, CellWarpReport, refine_cell_samples},
     color::rgb8,
     geometry::{Quad, estimated_size, rectify},
     grid::{Candidate, EdgeProfiles, SearchOptions, search},
+    indexed_png,
     integral::IntegralImage,
     metrics::{OutputMetrics, measure_output},
-    palette::{CellColor, cluster},
+    palette::{
+        CellColor, PaletteSelectionReport, SmartPaletteOptions, cluster, nearest_palette_index,
+        select_smart_palette,
+    },
     ramp::{RampOptions, RampReport, penalize_one_cell_ramps},
     warp::{WarpField, WarpOptions, fit_local_warp},
 };
@@ -63,9 +68,25 @@ struct Args {
     #[arg(long, default_value_t = 0.035)]
     merge_threshold: f64,
 
-    /// Hard upper bound for the final palette.
+    /// Hard upper bound for the final palette (maximum 256 for indexed PNG).
     #[arg(long)]
     max_colors: Option<usize>,
+
+    /// Use edge-aware candidate palettes and automatic color-count selection.
+    #[arg(long)]
+    smart_palette: bool,
+
+    /// Largest fixed palette considered by smart selection.
+    #[arg(long, default_value_t = 12)]
+    palette_candidate_max: usize,
+
+    /// Complexity cost for each smart-palette color beyond two.
+    #[arg(long, default_value_t = 0.08)]
+    palette_penalty: f64,
+
+    /// Extra weight given to colors on high-contrast logical-pixel edges.
+    #[arg(long, default_value_t = 1.0)]
+    palette_edge_emphasis: f64,
 
     /// Favor larger logical pixels when multiple grids fit equally well.
     #[arg(long, default_value_t = 0.002)]
@@ -119,6 +140,38 @@ struct Args {
     #[arg(long, default_value_t = 1.5)]
     warp_smoothness: f64,
 
+    /// Refine individual source-cell sampling after the smooth local warp.
+    #[arg(long)]
+    cell_warp: bool,
+
+    /// Maximum per-cell residual sampling displacement in source pixels.
+    #[arg(long, default_value_t = 1.5)]
+    cell_warp_radius: f64,
+
+    /// Per-cell residual displacement search increment.
+    #[arg(long, default_value_t = 0.25)]
+    cell_warp_step: f64,
+
+    /// Cost that discourages unnecessary per-cell movement.
+    #[arg(long, default_value_t = 0.006)]
+    cell_warp_movement: f64,
+
+    /// Minimum relative variance reduction required to accept a per-cell shift.
+    #[arg(long, default_value_t = 0.18)]
+    cell_warp_min_improvement: f64,
+
+    /// Minimum mixed-color variance required before a cell can shift.
+    #[arg(long, default_value_t = 0.0008)]
+    cell_warp_min_variance: f64,
+
+    /// Minimum Oklab contrast with a neighboring cell required before shifting.
+    #[arg(long, default_value_t = 0.10)]
+    cell_warp_contrast: f64,
+
+    /// Minimum Oklab neighbor-contrast increase required from a per-cell shift.
+    #[arg(long, default_value_t = 0.015)]
+    cell_warp_min_contrast_gain: f64,
+
     /// Penalty for a one-cell color ramp between high-contrast neighbors; 0 disables it.
     #[arg(long, default_value_t = 0.3)]
     ramp_penalty: f64,
@@ -150,13 +203,17 @@ struct Report {
     output_width: u32,
     output_height: u32,
     output_block: u32,
+    output_color_type: &'static str,
+    output_bit_depth: u8,
     source_width: u32,
     source_height: u32,
     perspective: Option<PerspectiveReport>,
     local_warp: Option<WarpReport>,
+    cell_warp: Option<CellWarpReport>,
     ramp_cleanup: RampReport,
     selected: Candidate,
     palette: Vec<[u8; 3]>,
+    palette_selection: Option<PaletteSelectionReport>,
     output_metrics: OutputMetrics,
     candidates: Vec<Candidate>,
     settings: ReportSettings,
@@ -188,6 +245,10 @@ struct ReportSettings {
     dimension_radius: f64,
     merge_threshold: f64,
     max_colors: Option<usize>,
+    smart_palette: bool,
+    palette_candidate_max: usize,
+    palette_penalty: f64,
+    palette_edge_emphasis: f64,
     complexity: f64,
 }
 
@@ -323,6 +384,16 @@ fn main() -> Result<()> {
     if args.output_block == Some(0) {
         bail!("output-block must be at least 1");
     }
+    if args.max_colors == Some(0)
+        || args.max_colors.is_some_and(|colors| colors > 256)
+        || args.palette_candidate_max < 2
+        || args.palette_penalty < 0.0
+        || args.palette_edge_emphasis < 0.0
+    {
+        bail!(
+            "palette settings require max-colors in 1..=256, candidate-max >= 2, and nonnegative penalty/edge emphasis"
+        );
+    }
     if args.local_warp
         && (args.warp_patch < 8
             || args.warp_radius <= 0.0
@@ -330,6 +401,19 @@ fn main() -> Result<()> {
             || args.warp_smoothness < 0.0)
     {
         bail!("warp settings require patch >= 8, radius/step > 0, and smoothness >= 0");
+    }
+    if (args.cell_warp || automatic)
+        && (args.cell_warp_radius <= 0.0
+            || args.cell_warp_step <= 0.0
+            || args.cell_warp_movement < 0.0
+            || !(0.0..1.0).contains(&args.cell_warp_min_improvement)
+            || args.cell_warp_min_variance < 0.0
+            || args.cell_warp_contrast <= 0.0
+            || args.cell_warp_min_contrast_gain < 0.0)
+    {
+        bail!(
+            "cell-warp settings require radius/step/contrast > 0, nonnegative movement/variance, and improvement in [0, 1)"
+        );
     }
     if args.ramp_penalty < 0.0
         || args.ramp_contrast <= 0.0
@@ -427,13 +511,76 @@ fn main() -> Result<()> {
             },
         )
     });
-    let cells = if let Some(warp) = &warp {
+    let baseline_cells = if let Some(warp) = &warp {
         extract_warped_cells(&image, selected, effective_inset, warp)
     } else {
         extract_cells(&integral, selected, effective_inset)
     };
-    let effective_max_colors = args.max_colors.or(automatic.then_some(32));
-    let (palette, mut assignments) = cluster(&cells, args.merge_threshold, effective_max_colors);
+    // Indexed PNG permits at most 256 entries. Auto mode uses the tighter
+    // flexible ceiling; manual mode still remains safely indexable.
+    let effective_max_color_count = args.max_colors.unwrap_or(if automatic { 32 } else { 256 });
+    let effective_max_colors = Some(effective_max_color_count);
+    let use_smart_palette = automatic || args.smart_palette;
+    let (palette, mut assignments, palette_selection) = if use_smart_palette {
+        let selection = select_smart_palette(
+            &baseline_cells,
+            SmartPaletteOptions {
+                candidate_max: args.palette_candidate_max,
+                max_colors: effective_max_color_count,
+                complexity_penalty: args.palette_penalty,
+                edge_emphasis: args.palette_edge_emphasis,
+                merge_threshold: args.merge_threshold,
+            },
+        );
+        (
+            selection.palette,
+            selection.assignments,
+            Some(selection.report),
+        )
+    } else {
+        let (palette, assignments) =
+            cluster(&baseline_cells, args.merge_threshold, effective_max_colors);
+        (palette, assignments, None)
+    };
+    let effective_cell_warp_radius = if automatic {
+        (recovered_scale * 0.18).clamp(0.75, 2.5)
+    } else {
+        args.cell_warp_radius
+    };
+    let effective_cell_warp_step = if automatic {
+        (recovered_scale / 32.0).clamp(0.2, 0.5)
+    } else {
+        args.cell_warp_step
+    };
+    let cell_warp = (args.cell_warp || automatic).then(|| {
+        refine_cell_samples(
+            &baseline_cells,
+            &integral,
+            selected,
+            effective_inset,
+            warp.as_ref(),
+            CellWarpOptions {
+                radius: effective_cell_warp_radius,
+                step: effective_cell_warp_step,
+                movement_penalty: args.cell_warp_movement,
+                min_improvement: args.cell_warp_min_improvement,
+                min_variance: args.cell_warp_min_variance,
+                contrast_threshold: args.cell_warp_contrast,
+                min_contrast_gain: args.cell_warp_min_contrast_gain,
+            },
+        )
+    });
+    let cells = cell_warp
+        .as_ref()
+        .map(|result| result.cells.clone())
+        .unwrap_or(baseline_cells);
+    if let Some(refinement) = &cell_warp {
+        for (index, cell) in cells.iter().enumerate() {
+            if refinement.offsets.contains_key(&(cell.cell_x, cell.cell_y)) {
+                assignments[index] = nearest_palette_index(cell.rgb, &palette);
+            }
+        }
+    }
     let ramp_cleanup = penalize_one_cell_ramps(
         &cells,
         &palette,
@@ -467,21 +614,38 @@ fn main() -> Result<()> {
         output_cells_x.clone(),
         output_cells_y.clone(),
     );
-    let corrected = RgbImage::from_fn(output_width, output_height, |x, y| {
-        // Source squeeze and local deformation affect identification only.
-        // Every recovered logical cell is repainted as an exact output square.
-        let cell_x = output_cells_x.start + (x / output_block) as i32;
-        let cell_y = output_cells_y.start + (y / output_block) as i32;
-        let index = cell_palette.get(&(cell_x, cell_y)).copied().unwrap_or(0);
-        Rgb(rgb8(palette[index]))
-    });
-
     let output = args
         .output
         .unwrap_or_else(|| suffixed_path(&args.input, ".corrected.png"));
-    corrected
-        .save(&output)
-        .with_context(|| format!("could not save {}", output.display()))?;
+    if output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("png"))
+    {
+        bail!("corrected output must use a .png extension");
+    }
+    let palette_rgb8: Vec<[u8; 3]> = palette.iter().copied().map(rgb8).collect();
+    let indexed_pixels: Vec<u8> = (0..output_height)
+        .flat_map(|y| {
+            let cell_palette = &cell_palette;
+            let output_cells_x = output_cells_x.clone();
+            let output_cells_y = output_cells_y.clone();
+            (0..output_width).map(move |x| {
+                // Source squeeze and local deformation affect identification only.
+                // Every recovered logical cell is repainted as an exact output square.
+                let cell_x = output_cells_x.start + (x / output_block) as i32;
+                let cell_y = output_cells_y.start + (y / output_block) as i32;
+                cell_palette.get(&(cell_x, cell_y)).copied().unwrap_or(0) as u8
+            })
+        })
+        .collect();
+    let output_bit_depth = indexed_png::save(
+        &output,
+        output_width,
+        output_height,
+        &indexed_pixels,
+        &palette_rgb8,
+    )?;
 
     let mut overlay = image.clone();
     for y in 0..overlay.height() {
@@ -508,6 +672,26 @@ fn main() -> Result<()> {
             }
         }
     }
+    if let Some(refinement) = &cell_warp {
+        for (&(cell_x, cell_y), &residual) in &refinement.offsets {
+            let nominal_x = selected.phase_x + (cell_x as f64 + 0.5) * block_width;
+            let nominal_y = selected.phase_y + (cell_y as f64 + 0.5) * block_height;
+            let smooth = warp
+                .as_ref()
+                .map(|field| field.displacement(nominal_x, nominal_y))
+                .unwrap_or([0.0; 2]);
+            let sample_x = (nominal_x + smooth[0] + residual[0]).round() as i32;
+            let sample_y = (nominal_y + smooth[1] + residual[1]).round() as i32;
+            for delta in -2..=2 {
+                for (x, y) in [(sample_x + delta, sample_y), (sample_x, sample_y + delta)] {
+                    if x >= 0 && y >= 0 && x < overlay.width() as i32 && y < overlay.height() as i32
+                    {
+                        overlay.put_pixel(x as u32, y as u32, Rgb([0, 255, 255]));
+                    }
+                }
+            }
+        }
+    }
     let overlay_path = suffixed_path(&output, ".grid.png");
     overlay
         .save(&overlay_path)
@@ -523,6 +707,8 @@ fn main() -> Result<()> {
         output_width,
         output_height,
         output_block,
+        output_color_type: "indexed",
+        output_bit_depth,
         source_width: source.width(),
         source_height: source.height(),
         perspective,
@@ -534,9 +720,11 @@ fn main() -> Result<()> {
             max_displacement: field.max_displacement(),
             rms_displacement: field.rms_displacement(),
         }),
+        cell_warp: cell_warp.as_ref().map(|result| result.report),
         ramp_cleanup,
         selected,
-        palette: palette.iter().copied().map(rgb8).collect(),
+        palette: palette_rgb8,
+        palette_selection,
         output_metrics,
         candidates,
         settings: ReportSettings {
@@ -547,6 +735,10 @@ fn main() -> Result<()> {
             dimension_radius: options.dimension_radius,
             merge_threshold: args.merge_threshold,
             max_colors: effective_max_colors,
+            smart_palette: use_smart_palette,
+            palette_candidate_max: args.palette_candidate_max,
+            palette_penalty: args.palette_penalty,
+            palette_edge_emphasis: args.palette_edge_emphasis,
             complexity: args.complexity,
         },
     };
@@ -569,6 +761,12 @@ fn main() -> Result<()> {
         selected.score,
         palette.len()
     );
+    if let Some(selection) = &report.palette_selection {
+        println!(
+            "palette selection: {} ({} histogram peaks, fixed candidates 2..={})",
+            selection.mode, selection.histogram_peaks, selection.fixed_candidate_limit
+        );
+    }
     println!(
         "output contrast: mean {:.6}, RMS {:.6}, strong edges {:.2}%, weak transitions {:.2}%, crispness {:.6}",
         output_metrics.mean_neighbor_distance,
@@ -588,6 +786,15 @@ fn main() -> Result<()> {
         println!(
             "auto score: {:.6}, edge alignment: {:.3}×",
             selected.auto_score, selected.edge_alignment
+        );
+    }
+    if let Some(refinement) = &cell_warp {
+        println!(
+            "per-cell sampling: {} of {} eligible cells shifted, RMS {:.3} px, max {:.3} px",
+            refinement.report.shifted_cells,
+            refinement.report.eligible_cells,
+            refinement.report.rms_displacement,
+            refinement.report.max_displacement,
         );
     }
     println!("corrected: {}", output.display());

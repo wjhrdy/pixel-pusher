@@ -1,6 +1,6 @@
 [package]
 name = "pixel-pusher"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Recover a clean logical pixel grid and palette from imperfect pixel art"
 repository = "https://github.com/wjhrdy/pixel-pusher"
@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "multimedia::images"]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+png = "0.18"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
