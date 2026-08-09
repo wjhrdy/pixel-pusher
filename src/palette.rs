@@ -36,8 +36,9 @@ pub struct SmartPaletteOptions {
     pub candidate_max: usize,
     /// Hard limit used by the flexible fallback.
     pub max_colors: usize,
-    /// Cost paid for each color beyond two.
-    pub complexity_penalty: f64,
+    /// Optional cost paid for each color beyond two. `None` derives the cost
+    /// from histogram complexity.
+    pub complexity_penalty: Option<f64>,
     /// Multiplier for cells lying on strong logical-pixel edges.
     pub edge_emphasis: f64,
     /// Merge radius used by the flexible fallback.
@@ -63,6 +64,7 @@ pub struct PaletteSelectionReport {
     pub distinct_histogram_bins: usize,
     pub histogram_peaks: usize,
     pub fixed_candidate_limit: usize,
+    pub effective_complexity_penalty: f64,
     pub candidates: Vec<PaletteCandidateReport>,
 }
 
@@ -441,6 +443,7 @@ pub fn select_smart_palette(cells: &[CellColor], options: SmartPaletteOptions) -
                 distinct_histogram_bins: 0,
                 histogram_peaks: 0,
                 fixed_candidate_limit: 0,
+                effective_complexity_penalty: 0.0,
                 candidates: Vec::new(),
             },
         };
@@ -456,6 +459,7 @@ pub fn select_smart_palette(cells: &[CellColor], options: SmartPaletteOptions) -
                 distinct_histogram_bins: 1,
                 histogram_peaks: 1,
                 fixed_candidate_limit: 1,
+                effective_complexity_penalty: 0.0,
                 candidates: Vec::new(),
             },
             palette,
@@ -466,13 +470,20 @@ pub fn select_smart_palette(cells: &[CellColor], options: SmartPaletteOptions) -
     let samples = edge_weighted_samples(cells, options.edge_emphasis.max(0.0));
     let (distinct_histogram_bins, peaks) = histogram_peaks(&samples);
     let candidate_limit = options.candidate_max.clamp(2, hard_limit);
+    // A peak-rich histogram is strong evidence that added colors carry real
+    // structure rather than merely splitting smooth ramps. Preserve those
+    // colors by reducing the rate penalty, while compacting simple artwork.
+    let effective_complexity_penalty = options.complexity_penalty.unwrap_or_else(|| {
+        let peak_fraction = (peaks.len() as f64 / candidate_limit as f64).clamp(0.0, 1.0);
+        0.08 * (1.0 - peak_fraction).powi(2)
+    });
     let mut candidates: Vec<_> = (2..=candidate_limit)
         .map(|colors| {
             build_candidate(
                 &samples,
                 &peaks,
                 colors,
-                options.complexity_penalty.max(0.0),
+                effective_complexity_penalty.max(0.0),
             )
         })
         .collect();
@@ -514,7 +525,7 @@ pub fn select_smart_palette(cells: &[CellColor], options: SmartPaletteOptions) -
     let use_flexible = hard_limit > candidate_limit
         && best_index + 1 == candidates.len()
         && peaks.len() > candidate_limit
-        && last_fit_gain > options.complexity_penalty * 0.8;
+        && last_fit_gain > effective_complexity_penalty * 0.8;
 
     let reports = candidates
         .iter()
@@ -529,6 +540,7 @@ pub fn select_smart_palette(cells: &[CellColor], options: SmartPaletteOptions) -
                 distinct_histogram_bins,
                 histogram_peaks: peaks.len(),
                 fixed_candidate_limit: candidate_limit,
+                effective_complexity_penalty,
                 candidates: reports,
             },
             palette,
@@ -543,6 +555,7 @@ pub fn select_smart_palette(cells: &[CellColor], options: SmartPaletteOptions) -
                 distinct_histogram_bins,
                 histogram_peaks: peaks.len(),
                 fixed_candidate_limit: candidate_limit,
+                effective_complexity_penalty,
                 candidates: reports,
             },
             palette: selected.palette,
@@ -576,7 +589,7 @@ mod tests {
             SmartPaletteOptions {
                 candidate_max: 8,
                 max_colors: 16,
-                complexity_penalty: 0.3,
+                complexity_penalty: Some(0.3),
                 edge_emphasis: 1.0,
                 merge_threshold: 0.035,
             },
@@ -596,13 +609,44 @@ mod tests {
             SmartPaletteOptions {
                 candidate_max: 12,
                 max_colors: 4,
-                complexity_penalty: 0.0,
+                complexity_penalty: Some(0.0),
                 edge_emphasis: 1.0,
                 merge_threshold: 0.01,
             },
         );
         assert!(result.palette.len() <= 4);
         assert_eq!(result.report.fixed_candidate_limit, 4);
+    }
+
+    #[test]
+    fn adaptive_penalty_preserves_a_peak_rich_palette() {
+        let cells: Vec<_> = [
+            [0.05, 0.05, 0.05],
+            [0.05, 0.05, 0.95],
+            [0.05, 0.95, 0.05],
+            [0.05, 0.95, 0.95],
+            [0.95, 0.05, 0.05],
+            [0.95, 0.05, 0.95],
+            [0.95, 0.95, 0.05],
+            [0.95, 0.95, 0.95],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(x, rgb)| cell(x as i32, 0, rgb))
+        .collect();
+        let result = select_smart_palette(
+            &cells,
+            SmartPaletteOptions {
+                candidate_max: 8,
+                max_colors: 8,
+                complexity_penalty: None,
+                edge_emphasis: 1.0,
+                merge_threshold: 0.035,
+            },
+        );
+        assert_eq!(result.report.histogram_peaks, 8);
+        assert_eq!(result.report.effective_complexity_penalty, 0.0);
+        assert_eq!(result.palette.len(), 8);
     }
 
     #[test]

@@ -80,9 +80,9 @@ struct Args {
     #[arg(long, default_value_t = 12)]
     palette_candidate_max: usize,
 
-    /// Complexity cost for each smart-palette color beyond two.
-    #[arg(long, default_value_t = 0.08)]
-    palette_penalty: f64,
+    /// Override the adaptive complexity cost for each palette color beyond two.
+    #[arg(long)]
+    palette_penalty: Option<f64>,
 
     /// Extra weight given to colors on high-contrast logical-pixel edges.
     #[arg(long, default_value_t = 1.0)]
@@ -247,7 +247,7 @@ struct ReportSettings {
     max_colors: Option<usize>,
     smart_palette: bool,
     palette_candidate_max: usize,
-    palette_penalty: f64,
+    palette_penalty: Option<f64>,
     palette_edge_emphasis: f64,
     complexity: f64,
 }
@@ -387,7 +387,7 @@ fn main() -> Result<()> {
     if args.max_colors == Some(0)
         || args.max_colors.is_some_and(|colors| colors > 256)
         || args.palette_candidate_max < 2
-        || args.palette_penalty < 0.0
+        || args.palette_penalty.is_some_and(|penalty| penalty < 0.0)
         || args.palette_edge_emphasis < 0.0
     {
         bail!(
