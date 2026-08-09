@@ -1,0 +1,6 @@
+/target
+/results
+.DS_Store
+*.corrected.png
+*.grid.png
+*.report.json
