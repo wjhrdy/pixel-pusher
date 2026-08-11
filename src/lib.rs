@@ -2,6 +2,7 @@ pub mod cell_warp;
 pub mod color;
 pub mod geometry;
 pub mod grid;
+pub mod gui;
 pub mod indexed_png;
 pub mod integral;
 pub mod metrics;

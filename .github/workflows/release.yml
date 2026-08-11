@@ -18,15 +18,19 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: pixel-pusher
+            gui_executable: pixel-pusher-gui
           - os: macos-latest
             target: x86_64-apple-darwin
             executable: pixel-pusher
+            gui_executable: pixel-pusher-gui
           - os: macos-latest
             target: aarch64-apple-darwin
             executable: pixel-pusher
+            gui_executable: pixel-pusher-gui
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             executable: pixel-pusher.exe
+            gui_executable: pixel-pusher-gui.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -46,7 +50,7 @@ jobs:
         shell: bash
         run: |
           archive="pixel-pusher-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C "target/${{ matrix.target }}/release" "${{ matrix.executable }}"
+          tar -czf "$archive" -C "target/${{ matrix.target }}/release" "${{ matrix.executable }}" "${{ matrix.gui_executable }}"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "$archive.sha256"
           else

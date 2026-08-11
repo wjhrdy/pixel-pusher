@@ -8,16 +8,17 @@ The output is always rendered onto a new, rigid lattice of exact square pixels. 
 
 ## Features
 
-- Automatic logical-pixel scale, x/y phase, fractional squeeze, palette, smooth and per-cell sampling warps, and output-scale selection
+- Automatic logical-pixel scale, x/y phase, fractional squeeze, palette, and output-scale selection
 - Independent source cell width and height with square output reconstruction
 - Fractional-area RGB/RGB² sampling through summed-area tables
-- Edge-aware, histogram-peak-seeded Oklab palette candidates with automatic color-count selection
+- Edge-aware, histogram-peak-seeded, hue-preserving Oklab palette candidates with automatic color-count selection
 - Optional hard palette limit and flexible threshold-clustering fallback
 - Compact indexed-color PNG output using 1, 2, 4, or 8 bits per pixel
 - One-cell color-ramp suppression with source-fidelity protection
 - Optional four-corner perspective rectification for photographed art
 - Perceptual output metrics for edge strength, weak transitions, and crispness
 - PNG, JPEG, and WebP input
+- Native drag-and-drop desktop app with OS file dialogs and four-corner editing
 
 ## Install
 
@@ -29,6 +30,8 @@ Pixel Pusher requires a current stable Rust toolchain.
 brew tap wjhrdy/pixel-pusher https://github.com/wjhrdy/pixel-pusher
 brew install pixel-pusher
 ```
+
+This installs both `pixel-pusher` and the native `pixel-pusher-gui` desktop executable.
 
 ### Prebuilt binaries
 
@@ -42,7 +45,7 @@ cd pixel-pusher
 cargo build --release
 ```
 
-The executable will be at `target/release/pixel-pusher`. You can also install it into Cargo's binary directory:
+The executables will be at `target/release/pixel-pusher` and `target/release/pixel-pusher-gui`. You can also install both into Cargo's binary directory:
 
 ```sh
 cargo install --path .
@@ -54,7 +57,27 @@ cargo install --path .
 pixel-pusher input.png --auto
 ```
 
-Auto mode selects the fundamental logical-pixel scale using both cell-interior consistency and periodic concentration of source gradients on candidate grid boundaries. It then refines fractional width, height, and phase; derives a scale-relative local sampling warp; compacts the palette; and renders an unsqueezed square-cell output. Only the input path and `--auto` are required.
+### Native desktop app
+
+Pixel Pusher includes a native Rust desktop application—there is no local server, embedded browser, or web runtime:
+
+```sh
+pixel-pusher --gui
+# or launch the dedicated executable
+pixel-pusher-gui
+```
+
+Drop in a PNG, JPEG, or WebP image, then save the corrected indexed PNG, detected-grid overlay, or JSON report through the operating system's file dialog. Auto mode deliberately has no configuration: it selects the regular grid, squeeze, palette, and output scale from built-in defaults. Choose Custom to expose the palette, grid, sampling, warp, edge, forced-cell, and perspective controls. You can open an image immediately with `pixel-pusher-gui input.png` or `pixel-pusher input.png --gui`.
+
+After processing, the input preview switches to the detected-grid visualization, with recovered boundaries in red and locally shifted samples in cyan. Toggle back to the original whenever you want to adjust perspective corners. The corrected square-pixel output remains visible directly below the input in the same scrollable workspace. All three previews render at 100% stored-pixel dimensions with nearest sampling; oversized images scroll instead of being fit or rescaled.
+
+For a rotated photograph or perspective-skewed capture, enable **Correct perspective** and drag the numbered handles to the source artwork's top-left, top-right, bottom-right, and bottom-left corners. Perspective rectification and local warp only alter source sampling. The downloaded image remains a rigid lattice of square pixels.
+
+The native window and file dialogs work on macOS, Windows, and Linux. Processing runs in a background thread on the same computer, and the existing command-line interface remains available for scripts and batch jobs.
+
+Every processing control includes an inline `i` badge. Hover it for a plain-language explanation of the setting, its default or conservative behavior, and the range that is normally useful.
+
+Auto mode selects the fundamental logical-pixel scale using both cell-interior consistency and periodic concentration of source gradients on candidate grid boundaries. It respects `--min-block` and `--max-block` as hard search bounds, refines fractional width, height, and phase, compacts the palette, and renders an unsqueezed square-cell output. Only the input path and `--auto` are required.
 
 The command writes three files next to the input:
 
@@ -103,7 +126,7 @@ output contrast: mean 0.043356, RMS 0.097066, strong edges 14.01%, weak transiti
 3. Refine the strongest candidates' phase and source width/height fractionally.
 4. Select the grid with the lowest normalized within-cell variance, with a small preference for larger cells to resolve exact divisor ties.
 5. Estimate one color per logical cell from only its inset interior.
-6. Build edge-weighted, histogram-peak-seeded Oklab k-means candidates for palette sizes 2 through 12.
+6. Build edge-weighted, histogram-peak-seeded Oklab k-means candidates for palette sizes 2 through 12, emphasizing chroma separation so small hue families remain represented.
 7. Score their reconstruction error and complexity, then choose a fixed candidate or a flexible threshold-clustered palette.
 8. Penalize one-cell intermediate-color ramps whose opposite neighbors are high contrast, while retaining a sampled-color fidelity cost.
 9. Paint every recovered cell onto a separate, perfectly square output lattice.
@@ -114,7 +137,7 @@ The report measures the final logical-pixel lattice in perceptual Oklab space. I
 
 Smart selection is enabled by `--auto`, or independently with `--smart-palette`. It builds a 16-bin-per-RGB-channel histogram of recovered cell colors, gives extra weight to cells on strong logical-pixel edges, finds radius-one local peaks, and uses the strongest peaks to seed deterministic weighted k-means candidates. Candidate sizes default to 2 through 12. Each candidate records weighted Oklab SSE, `log10(SSE + 1)`, a per-color complexity penalty, normalized fit, and its smallest cluster fraction in the JSON report.
 
-The lowest rate-distortion cost wins. By default, the complexity penalty adapts to the quantized histogram: peak-rich images retain larger palettes, while simple images still compact aggressively. If the fit curve is still improving at the end of a peak-rich candidate bank, a flexible threshold-clustered palette may be used up to `--max-colors` (32 in auto mode). Tune the fixed bank with `--palette-candidate-max`, override the adaptive tradeoff with `--palette-penalty` (`0` retains the best-fitting candidate; larger values produce smaller palettes), and tune outline/highlight preservation with `--palette-edge-emphasis`. `--max-colors` always remains a hard ceiling. The effective penalty is recorded in the JSON palette-selection report.
+The lowest rate-distortion cost wins. By default, the complexity penalty adapts to the quantized histogram: peak-rich images retain larger palettes, while simple images still compact aggressively. If the fit curve is still improving at the end of a peak-rich candidate bank, a flexible threshold-clustered palette may use up to 24 colors by default. Tune the fixed bank with `--palette-candidate-max`, override the adaptive tradeoff with `--palette-penalty` (`0` retains the best-fitting candidate; larger values produce smaller palettes), and tune outline/highlight preservation with `--palette-edge-emphasis`. An explicit `--max-colors` changes the hard ceiling. The effective penalty is recorded in the JSON palette-selection report.
 
 Corrected images are written as indexed-color PNGs. Palettes of 1–2, 3–4, 5–16, and 17–256 colors use 1, 2, 4, and 8 bits per pixel respectively. The JSON report records `output_color_type` and `output_bit_depth`; grid overlays remain ordinary RGB PNGs. Indexed PNG cannot represent more than 256 colors, so `--max-colors` is limited accordingly.
 
@@ -148,7 +171,7 @@ The image is covered by a coarse control mesh. Each control point searches a sma
 
 The main controls are `--warp-patch` (control spacing), `--warp-radius` (maximum displacement), `--warp-step`, and `--warp-smoothness`.
 
-Auto mode follows the smooth field with a finer per-cell residual search. Only internally mixed cells next to a high-contrast neighbor are eligible, and a shift is accepted only when it both materially reduces inset variance and increases neighbor contrast after a movement penalty. This can align a tooth, highlight, or other one-logical-pixel feature without moving an entire local patch. Enable it explicitly outside auto mode with `--cell-warp`; tune it with `--cell-warp-radius`, `--cell-warp-step`, `--cell-warp-movement`, `--cell-warp-min-improvement`, `--cell-warp-min-variance`, `--cell-warp-contrast`, and `--cell-warp-min-contrast-gain`. Cyan crosses in the grid overlay mark cells whose sampling centers shifted.
+The optional per-cell residual search considers only internally mixed cells next to a high-contrast neighbor, and accepts a shift only when it both materially reduces inset variance and increases neighbor contrast after a movement penalty. This can align a tooth, highlight, or other one-logical-pixel feature without moving an entire local patch. Enable it explicitly with `--cell-warp`; tune it with `--cell-warp-radius`, `--cell-warp-step`, `--cell-warp-movement`, `--cell-warp-min-improvement`, `--cell-warp-min-variance`, `--cell-warp-contrast`, and `--cell-warp-min-contrast-gain`. Cyan crosses in the grid overlay mark cells whose sampling centers shifted. Both warp stages are disabled by default because rigid sampling is more predictable for most artwork.
 
 Neither warp is used for output geometry: estimated colors are always painted back onto the original rigid, axis-aligned logical grid, so curved or subpixel cell boundaries cannot appear in the corrected image.
 
@@ -156,7 +179,7 @@ Neither warp is used for output geometry: estimated colors are always painted ba
 
 - It assumes an axis-aligned, regularly spaced grid; width and height are independent.
 - It searches fractional source cell dimensions and x/y phase offsets; output cells remain integer squares.
-- Perspective and rotation are handled from four supplied corners; automatic corner detection and locally warped grids are not yet modeled.
+- Perspective and rotation are handled from four supplied corners, including draggable handles in the local UI; automatic corner detection is not yet included.
 - Palette membership is global, although topology-derived edge weights protect rare outlines and highlights. Region-specific palettes are not yet modeled.
 
 ## Development

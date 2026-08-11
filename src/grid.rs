@@ -241,7 +241,7 @@ fn refine_dimensions(
         let previous = best;
         for step in -dimension_steps..=dimension_steps {
             let width = nominal_width + step as f64 * options.dimension_step;
-            if width < 1.0 {
+            if width < options.min_width as f64 || width > options.max_width as f64 {
                 continue;
             }
             let phase_x =
@@ -255,7 +255,7 @@ fn refine_dimensions(
         let previous = best;
         for step in -dimension_steps..=dimension_steps {
             let height = nominal_height + step as f64 * options.dimension_step;
-            if height < 1.0 {
+            if height < options.min_height as f64 || height > options.max_height as f64 {
                 continue;
             }
             let phase_y = reanchor_phase(
@@ -500,5 +500,37 @@ mod tests {
         let best = candidates[0];
         assert!((best.cell_width - cell_size).abs() <= 0.11, "{best:?}");
         assert!((best.cell_height - cell_size).abs() <= 0.11, "{best:?}");
+    }
+
+    #[test]
+    fn fractional_refinement_never_escapes_requested_grid_bounds() {
+        let image = RgbImage::from_fn(80, 80, |x, y| {
+            let cell_x = x as i32 / 10;
+            let cell_y = y as i32 / 10;
+            Rgb(source_color(cell_x, cell_y).map(|value| (value * 255.0).round() as u8))
+        });
+        let integral = IntegralImage::new(&image);
+        let profiles = EdgeProfiles::new(&image);
+        let candidates = search(
+            &integral,
+            SearchOptions {
+                min_width: 2,
+                max_width: 5,
+                min_height: 2,
+                max_height: 5,
+                inset_ratio: 0.14,
+                phase_step: 0.25,
+                dimension_step: 0.1,
+                dimension_radius: 0.75,
+                complexity: 0.002,
+                auto_select: true,
+                square_coarse: true,
+            },
+            Some(&profiles),
+        );
+        assert!(candidates.iter().all(|candidate| {
+            (2.0..=5.0).contains(&candidate.cell_width)
+                && (2.0..=5.0).contains(&candidate.cell_height)
+        }));
     }
 }

@@ -1,4 +1,4 @@
-use crate::color::{distance_squared, srgb_to_oklab};
+use crate::color::srgb_to_oklab;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -10,14 +10,29 @@ pub struct CellColor {
     pub weight: f64,
 }
 
+// Palette reduction should not trade away an entire hue family merely because
+// its cells occupy a narrow luminance range. Oklab is perceptually uniform, but
+// unweighted squared distance still lets the many lightness steps common in
+// generated pixel art dominate a small warm/cool accent. A modest chroma-axis
+// emphasis keeps those hue branches competitive without changing the grid,
+// warp, ramp, or output-metric distance functions.
+const PALETTE_CHROMA_WEIGHT: f64 = 2.0;
+
+fn palette_distance_squared(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let lightness = a[0] - b[0];
+    let chroma_a = (a[1] - b[1]) * PALETTE_CHROMA_WEIGHT;
+    let chroma_b = (a[2] - b[2]) * PALETTE_CHROMA_WEIGHT;
+    lightness * lightness + chroma_a * chroma_a + chroma_b * chroma_b
+}
+
 pub fn nearest_palette_index(rgb: [f64; 3], palette: &[[f64; 3]]) -> usize {
     let lab = srgb_to_oklab(rgb);
     palette
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| {
-            distance_squared(lab, srgb_to_oklab(**a))
-                .total_cmp(&distance_squared(lab, srgb_to_oklab(**b)))
+            palette_distance_squared(lab, srgb_to_oklab(**a))
+                .total_cmp(&palette_distance_squared(lab, srgb_to_oklab(**b)))
         })
         .map(|(index, _)| index)
         .unwrap_or(0)
@@ -101,7 +116,7 @@ pub fn cluster(
         let nearest = centers
             .iter()
             .enumerate()
-            .map(|(index, center)| (index, distance_squared(lab, center.lab)))
+            .map(|(index, center)| (index, palette_distance_squared(lab, center.lab)))
             .min_by(|a, b| a.1.total_cmp(&b.1));
         if let Some((index, _distance)) =
             nearest.filter(|(_, distance)| *distance <= threshold * threshold)
@@ -141,7 +156,7 @@ pub fn cluster(
                     let merit = |sample: &&Center| {
                         centers
                             .iter()
-                            .map(|center| distance_squared(sample.lab, center.lab))
+                            .map(|center| palette_distance_squared(sample.lab, center.lab))
                             .fold(f64::INFINITY, f64::min)
                             * sample.weight.sqrt()
                     };
@@ -164,7 +179,8 @@ pub fn cluster(
                 .iter()
                 .enumerate()
                 .min_by(|(_, a), (_, b)| {
-                    distance_squared(lab, a.lab).total_cmp(&distance_squared(lab, b.lab))
+                    palette_distance_squared(lab, a.lab)
+                        .total_cmp(&palette_distance_squared(lab, b.lab))
                 })
                 .map(|(index, _)| index)
                 .unwrap_or(0);
@@ -211,7 +227,7 @@ fn edge_weighted_samples(cells: &[CellColor], edge_emphasis: f64) -> Vec<Weighte
             let mut edge_signal = 0.0_f64;
             for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
                 if let Some(&neighbor) = positions.get(&(cell.cell_x + dx, cell.cell_y + dy)) {
-                    edge_signal += distance_squared(labs[index], labs[neighbor]).sqrt();
+                    edge_signal += palette_distance_squared(labs[index], labs[neighbor]).sqrt();
                 }
             }
             // About 0.08 Oklab is already a visibly strong logical-pixel edge.
@@ -313,7 +329,7 @@ fn seed_centers(samples: &[WeightedSample], peaks: &[[f64; 3]], count: usize) ->
                     } else {
                         centers
                             .iter()
-                            .map(|center| distance_squared(sample.lab, center.lab))
+                            .map(|center| palette_distance_squared(sample.lab, center.lab))
                             .fold(f64::INFINITY, f64::min)
                     };
                     distance * sample.weight.sqrt()
@@ -349,8 +365,8 @@ fn build_candidate(
                 .iter()
                 .enumerate()
                 .min_by(|(_, a), (_, b)| {
-                    distance_squared(sample.lab, a.lab)
-                        .total_cmp(&distance_squared(sample.lab, b.lab))
+                    palette_distance_squared(sample.lab, a.lab)
+                        .total_cmp(&palette_distance_squared(sample.lab, b.lab))
                 })
                 .map(|(index, _)| index)
                 .unwrap_or(0);
@@ -388,13 +404,14 @@ fn build_candidate(
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                distance_squared(sample.lab, a.lab).total_cmp(&distance_squared(sample.lab, b.lab))
+                palette_distance_squared(sample.lab, a.lab)
+                    .total_cmp(&palette_distance_squared(sample.lab, b.lab))
             })
             .map(|(index, _)| index)
             .unwrap_or(0);
         assignments[index] = nearest;
         cluster_weights[nearest] += sample.weight;
-        sse += sample.weight * distance_squared(sample.lab, centers[nearest].lab);
+        sse += sample.weight * palette_distance_squared(sample.lab, centers[nearest].lab);
     }
     let total_weight = cluster_weights.iter().sum::<f64>();
     let minimum_cluster_fraction = cluster_weights
@@ -659,5 +676,16 @@ mod tests {
         let samples = edge_weighted_samples(&cells, 1.0);
         assert!(samples[1].weight > samples[0].weight);
         assert!(samples[2].weight > samples[0].weight);
+    }
+
+    #[test]
+    fn palette_distance_does_not_let_lightness_dominate_hue() {
+        let origin = [0.5, 0.0, 0.0];
+        let lightness_step = palette_distance_squared(origin, [0.6, 0.0, 0.0]);
+        let hue_step = palette_distance_squared(origin, [0.5, 0.1, 0.0]);
+
+        assert!((lightness_step - 0.01).abs() < 1e-12);
+        assert!((hue_step - 0.04).abs() < 1e-12);
+        assert!(hue_step > lightness_step);
     }
 }

@@ -27,17 +27,19 @@ use std::{
 #[command(about = "Recover a clean pixel grid and compact palette from imperfect pixel art")]
 struct Args {
     /// Source PNG, JPEG, or WebP.
-    input: PathBuf,
+    #[arg(required_unless_present = "gui")]
+    input: Option<PathBuf>,
+
+    /// Open the native drag-and-drop desktop application.
+    #[arg(long, visible_alias = "ui")]
+    gui: bool,
 
     /// Corrected output image. Defaults to <input>.corrected.png.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Automatically select scale, squeeze, phase, local warp, palette, and output scale.
-    #[arg(
-        long,
-        conflicts_with_all = ["block", "block_width", "block_height", "local_warp"]
-    )]
+    /// Automatically select scale, squeeze, phase, palette, and output scale.
+    #[arg(long, conflicts_with_all = ["block", "block_width", "block_height"])]
     auto: bool,
 
     /// Smallest source-pixel cell dimension to test in both directions.
@@ -239,6 +241,10 @@ struct PerspectiveReport {
 #[derive(Serialize)]
 struct ReportSettings {
     auto: bool,
+    min_cell_width: u32,
+    max_cell_width: u32,
+    min_cell_height: u32,
+    max_cell_height: u32,
     inset_ratio: f64,
     phase_step: f64,
     dimension_step: f64,
@@ -364,6 +370,14 @@ fn extract_warped_cells(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.gui {
+        return pixel_pusher::gui::run_with_image(args.input.clone())
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
+    let input = args
+        .input
+        .as_ref()
+        .context("an input image is required unless --gui is used")?;
     let automatic = args.auto;
     if args.min_block < 1 || args.max_block < args.min_block {
         bail!("block range must satisfy 1 <= min-block <= max-block");
@@ -402,7 +416,7 @@ fn main() -> Result<()> {
     {
         bail!("warp settings require patch >= 8, radius/step > 0, and smoothness >= 0");
     }
-    if (args.cell_warp || automatic)
+    if args.cell_warp
         && (args.cell_warp_radius <= 0.0
             || args.cell_warp_step <= 0.0
             || args.cell_warp_movement < 0.0
@@ -423,10 +437,10 @@ fn main() -> Result<()> {
         bail!("ramp penalty must be nonnegative and ramp contrast/tolerance must be positive");
     }
 
-    let source = ImageReader::open(&args.input)
-        .with_context(|| format!("could not open {}", args.input.display()))?
+    let source = ImageReader::open(input)
+        .with_context(|| format!("could not open {}", input.display()))?
         .decode()
-        .with_context(|| format!("could not decode {}", args.input.display()))?
+        .with_context(|| format!("could not decode {}", input.display()))?
         .to_rgb8();
     let (image, perspective) = if let Some(corners) = args.corners {
         let estimated = estimated_size(corners);
@@ -454,17 +468,9 @@ fn main() -> Result<()> {
     let effective_inset = if automatic { 0.18 } else { args.inset };
     let options = SearchOptions {
         min_width: forced_width.unwrap_or(args.min_block),
-        max_width: forced_width.unwrap_or(if automatic {
-            args.max_block.max(32)
-        } else {
-            args.max_block
-        }),
+        max_width: forced_width.unwrap_or(args.max_block),
         min_height: forced_height.unwrap_or(args.min_block),
-        max_height: forced_height.unwrap_or(if automatic {
-            args.max_block.max(32)
-        } else {
-            args.max_block
-        }),
+        max_height: forced_height.unwrap_or(args.max_block),
         inset_ratio: effective_inset,
         phase_step: args.phase_step,
         dimension_step: args.dimension_step,
@@ -498,7 +504,7 @@ fn main() -> Result<()> {
     } else {
         args.warp_smoothness
     };
-    let warp = (args.local_warp || automatic).then(|| {
+    let warp = args.local_warp.then(|| {
         fit_local_warp(
             &integral,
             selected,
@@ -516,9 +522,9 @@ fn main() -> Result<()> {
     } else {
         extract_cells(&integral, selected, effective_inset)
     };
-    // Indexed PNG permits at most 256 entries. Auto mode uses the tighter
-    // flexible ceiling; manual mode still remains safely indexable.
-    let effective_max_color_count = args.max_colors.unwrap_or(if automatic { 32 } else { 256 });
+    // Indexed PNG permits at most 256 entries. Keep the default compact in
+    // both modes while allowing an explicit larger ceiling when requested.
+    let effective_max_color_count = args.max_colors.unwrap_or(24);
     let effective_max_colors = Some(effective_max_color_count);
     let use_smart_palette = automatic || args.smart_palette;
     let (palette, mut assignments, palette_selection) = if use_smart_palette {
@@ -552,7 +558,7 @@ fn main() -> Result<()> {
     } else {
         args.cell_warp_step
     };
-    let cell_warp = (args.cell_warp || automatic).then(|| {
+    let cell_warp = args.cell_warp.then(|| {
         refine_cell_samples(
             &baseline_cells,
             &integral,
@@ -616,7 +622,7 @@ fn main() -> Result<()> {
     );
     let output = args
         .output
-        .unwrap_or_else(|| suffixed_path(&args.input, ".corrected.png"));
+        .unwrap_or_else(|| suffixed_path(input, ".corrected.png"));
     if output
         .extension()
         .and_then(|extension| extension.to_str())
@@ -699,7 +705,7 @@ fn main() -> Result<()> {
 
     let report_path = suffixed_path(&output, ".report.json");
     let report = Report {
-        source: args.input.display().to_string(),
+        source: input.display().to_string(),
         output: output.display().to_string(),
         overlay: overlay_path.display().to_string(),
         width: image.width(),
@@ -729,6 +735,10 @@ fn main() -> Result<()> {
         candidates,
         settings: ReportSettings {
             auto: automatic,
+            min_cell_width: options.min_width,
+            max_cell_width: options.max_width,
+            min_cell_height: options.min_height,
+            max_cell_height: options.max_height,
             inset_ratio: effective_inset,
             phase_step: args.phase_step,
             dimension_step: args.dimension_step,
