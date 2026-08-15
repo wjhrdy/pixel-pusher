@@ -437,7 +437,13 @@ fn main() -> Result<()> {
         iterations: args.lattice_iterations,
     };
     let lattice = if use_lattice_fit {
-        fit_lattice(&integral, selected, effective_inset, lattice_options)
+        fit_lattice(
+            &image,
+            &integral,
+            selected,
+            effective_inset,
+            lattice_options,
+        )
     } else {
         FittedLattice::regular(selected, integral.width(), integral.height())
     };
@@ -651,6 +657,10 @@ fn main() -> Result<()> {
         );
     }
     if let Some(fit) = &report.lattice_fit {
+        println!(
+            "lattice init: {} vertical lines, {} horizontal lines, {} corner seeds",
+            fit.initial_vertical_lines, fit.initial_horizontal_lines, fit.initialized_corner_nodes,
+        );
         println!(
             "lattice fit: {} corner anchors, {} junctions moved, RMS {:.3} px, max {:.3} px",
             fit.supported_nodes, fit.moved_nodes, fit.rms_displacement, fit.max_displacement,

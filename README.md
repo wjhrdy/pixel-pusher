@@ -8,7 +8,7 @@ The output is always rendered onto a new, rigid lattice of exact square pixels. 
 
 ## Features
 
-- Automatic logical-pixel scale, x/y phase, fractional squeeze, edge-gated lattice fitting, palette, and output-scale selection
+- Automatic logical-pixel scale, x/y phase, fractional squeeze, clustered-line lattice initialization, edge-gated local fitting, palette, and output-scale selection
 - Independent source cell width and height with square output reconstruction
 - Fractional-area RGB/RGB² sampling through summed-area tables
 - Edge-aware, histogram-peak-seeded, hue-preserving Oklab palette candidates with automatic color-count selection
@@ -68,7 +68,7 @@ pixel-pusher --gui
 pixel-pusher-gui
 ```
 
-Drop in a PNG, JPEG, or WebP image, then save the corrected indexed PNG, detected-grid overlay, or JSON report through the operating system's file dialog. Auto mode deliberately has no configuration: it selects the regular grid, squeeze, edge-gated local lattice, palette, and output scale from built-in defaults. Choose Custom to expose the palette, grid, sampling, lattice, edge, forced-cell, and perspective controls. You can open an image immediately with `pixel-pusher-gui input.png` or `pixel-pusher input.png --gui`.
+Drop in a PNG, JPEG, or WebP image, then save the corrected indexed PNG, detected-grid overlay, or JSON report through the operating system's file dialog. Auto mode deliberately has no configuration: it selects the regular grid, squeeze, edge-gated local lattice, palette, and output scale from built-in defaults. Choose Custom to expose the palette, grid, sampling, lattice, edge, forced-cell, and perspective controls. Untouched Custom mode continues to use the exact Auto pipeline; explicit Custom processing begins only after a control changes, and Reset defaults returns to the Auto baseline. You can open an image immediately with `pixel-pusher-gui input.png` or `pixel-pusher input.png --gui`.
 
 After processing, the input preview switches to the detected-grid visualization. The complete fitted mesh is red; dark segments identify locally supported boundaries, green squares mark high-confidence corner anchors with both horizontal and vertical evidence, and cyan crosses mark cells whose final palette choice differs from regular-grid sampling. Toggle back to the original whenever you want to adjust perspective corners. The corrected square-pixel output remains visible directly below the input in the same scrollable workspace. All three previews render at 100% stored-pixel dimensions with nearest sampling; oversized images scroll instead of being fit or rescaled.
 
@@ -170,7 +170,9 @@ pixel-pusher input.png --block 4 --lattice-fit --inset 0.18
 
 This follows the [lattice-fitting motivation described here](https://www.reddit.com/r/aigamedev/comments/1u9etqa/comment/p2x7zzp/?context=3): locally grid-like regions can still disagree globally, so fitting one uniform phase is not always enough.
 
-The regular grid supplies a topologically stable 2D seed mesh. Fitting happens hierarchically. First, a joint 2D search snaps high-confidence corners where vertical and horizontal boundary evidence coincide. Then edge-only points may refine one axis only when snapped corner anchors exist in the same logical row or column. Anchor influence decays with lattice distance, so nearby corners matter more than distant ones. The four neighboring cells provide fit quality and displacement regularization keeps the mesh coherent. Every mesh edge remains shared by adjacent cells, preventing gaps, overlaps, and isolated per-cell sampling jumps.
+The regular grid supplies the scale, phase, logical indexing, and topology for a stable 2D seed mesh. A line-first initialization—adapted from Kenneth Allen's MIT-licensed [Proper Pixel Art](https://github.com/KennethJAllen/proper-pixel-art)—detects coherent axis-aligned boundaries, clusters nearby detections, and fills missing lines between reliable anchors at the recovered spacing. To preserve Pixel Pusher's corner priority, those lines seed the mesh only where vertical and horizontal evidence form a distinct corner. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
+
+Fitting then happens hierarchically. First, a joint 2D search snaps high-confidence corners where vertical and horizontal boundary evidence coincide. Then edge-only points may refine one axis only when snapped corner anchors exist in the same logical row or column. Anchor influence decays with lattice distance, so nearby corners matter more than distant ones. The four neighboring cells provide fit quality and displacement regularization keeps the mesh coherent. Every mesh edge remains shared by adjacent cells, preventing gaps, overlaps, and isolated per-cell sampling jumps.
 
 Edge evidence is local and contrast-weighted: strong, distinct pixel boundaries carry most of the vote, while flat and low-detail neighborhoods contribute little. A corner cannot become an anchor unless both axes exceed `--lattice-min-edge`. A point on only a vertical or horizontal boundary can still snap, but only during the second pass and only when corner anchors in its column or row support that motion. Strong unanchored edges therefore cannot deform the mesh by themselves.
 

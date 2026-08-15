@@ -27,6 +27,9 @@ pub struct LatticeFitReport {
     pub edge_weight: f64,
     pub min_edge_strength: f64,
     pub iterations: u32,
+    pub initial_vertical_lines: usize,
+    pub initial_horizontal_lines: usize,
+    pub initialized_corner_nodes: usize,
     pub fitted_nodes: usize,
     pub supported_nodes: usize,
     pub moved_nodes: usize,
@@ -63,6 +66,186 @@ impl AxisSeed {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DetectedLine {
+    coordinate: f64,
+    strength: f64,
+}
+
+fn pixel_edge_strength(image: &RgbImage, coordinate: usize, along: usize, axis: usize) -> f64 {
+    let (left, right) = if axis == 0 {
+        (
+            image.get_pixel((coordinate - 1) as u32, along as u32),
+            image.get_pixel(coordinate as u32, along as u32),
+        )
+    } else {
+        (
+            image.get_pixel(along as u32, (coordinate - 1) as u32),
+            image.get_pixel(along as u32, coordinate as u32),
+        )
+    };
+    ((0..3)
+        .map(|channel| {
+            let difference = right[channel] as f64 - left[channel] as f64;
+            (difference / 255.0).powi(2)
+        })
+        .sum::<f64>()
+        / 3.0)
+        .sqrt()
+}
+
+fn coherent_line_strength(
+    image: &RgbImage,
+    coordinate: usize,
+    axis: usize,
+    threshold: f64,
+    max_gap: usize,
+    minimum_span: usize,
+) -> Option<f64> {
+    let length = if axis == 0 {
+        image.height() as usize
+    } else {
+        image.width() as usize
+    };
+    let mut run_start = 0;
+    let mut last_strong = 0;
+    let mut hits = 0_usize;
+    let mut sum_sq = 0.0;
+    let mut best = 0.0_f64;
+    for along in 0..length {
+        let strength = pixel_edge_strength(image, coordinate, along, axis);
+        if strength < threshold {
+            continue;
+        }
+        if hits == 0 || along.saturating_sub(last_strong) > max_gap + 1 {
+            run_start = along;
+            hits = 0;
+            sum_sq = 0.0;
+        }
+        last_strong = along;
+        hits += 1;
+        sum_sq += strength * strength;
+        let span = last_strong - run_start + 1;
+        if hits >= 2 && span >= minimum_span {
+            let rms = (sum_sq / hits as f64).sqrt();
+            best = best.max(rms * (span as f64 / minimum_span as f64).sqrt());
+        }
+    }
+    (best > 0.0).then_some(best)
+}
+
+fn cluster_detected_lines(mut lines: Vec<DetectedLine>, threshold: f64) -> Vec<DetectedLine> {
+    lines.sort_by(|left, right| left.coordinate.total_cmp(&right.coordinate));
+    let mut clustered = Vec::new();
+    let mut start = 0;
+    while start < lines.len() {
+        let mut end = start + 1;
+        while end < lines.len() && lines[end].coordinate - lines[end - 1].coordinate <= threshold {
+            end += 1;
+        }
+        let cluster = &lines[start..end];
+        clustered.push(DetectedLine {
+            coordinate: cluster[cluster.len() / 2].coordinate,
+            strength: cluster.iter().map(|line| line.strength).fold(0.0, f64::max),
+        });
+        start = end;
+    }
+    clustered
+}
+
+fn detect_axis_lines(
+    image: &RgbImage,
+    axis: usize,
+    spacing: f64,
+    orthogonal_spacing: f64,
+    minimum_edge_strength: f64,
+) -> Vec<DetectedLine> {
+    let limit = if axis == 0 {
+        image.width() as usize
+    } else {
+        image.height() as usize
+    };
+    let maximum_gap = (orthogonal_spacing * 0.45).round().max(1.0) as usize;
+    let minimum_span = (orthogonal_spacing * 0.65).round().max(2.0) as usize;
+    let candidates = (1..limit)
+        .filter_map(|coordinate| {
+            coherent_line_strength(
+                image,
+                coordinate,
+                axis,
+                minimum_edge_strength,
+                maximum_gap,
+                minimum_span,
+            )
+            .map(|strength| DetectedLine {
+                coordinate: coordinate as f64,
+                strength,
+            })
+        })
+        .collect();
+    cluster_detected_lines(candidates, (spacing * 0.35).clamp(1.0, 4.0))
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        0.5 * (values[middle - 1] + values[middle])
+    } else {
+        values[middle]
+    })
+}
+
+fn completed_axis_lines(lines: &[DetectedLine], nominal_spacing: f64) -> Vec<f64> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut gaps: Vec<f64> = lines
+        .windows(2)
+        .map(|pair| pair[1].coordinate - pair[0].coordinate)
+        .filter(|gap| *gap > nominal_spacing * 0.45)
+        .collect();
+    gaps.sort_by(f64::total_cmp);
+    let trim = (gaps.len() as f64 * 0.2).floor() as usize;
+    let trimmed_end = gaps.len().saturating_sub(trim);
+    let estimated = (trim < trimmed_end)
+        .then(|| median(&mut gaps[trim..trimmed_end]))
+        .flatten()
+        .filter(|spacing| *spacing >= nominal_spacing * 0.7 && *spacing <= nominal_spacing * 1.3)
+        .unwrap_or(nominal_spacing);
+
+    let mut completed = vec![lines[0].coordinate];
+    for pair in lines.windows(2) {
+        let gap = pair[1].coordinate - pair[0].coordinate;
+        let divisions = (gap / estimated).round().max(1.0) as usize;
+        let section_spacing = gap / divisions as f64;
+        if divisions > 1
+            && section_spacing >= nominal_spacing * 0.6
+            && section_spacing <= nominal_spacing * 1.4
+        {
+            completed.extend(
+                (1..divisions)
+                    .map(|division| pair[0].coordinate + division as f64 * section_spacing),
+            );
+        }
+        completed.push(pair[1].coordinate);
+    }
+    completed.sort_by(f64::total_cmp);
+    completed.dedup_by(|left, right| (*left - *right).abs() < 1e-9);
+    completed
+}
+
+fn nearest_line(lines: &[f64], nominal: f64, radius: f64) -> Option<f64> {
+    lines
+        .iter()
+        .copied()
+        .min_by(|left, right| (left - nominal).abs().total_cmp(&(right - nominal).abs()))
+        .filter(|coordinate| (coordinate - nominal).abs() <= radius + 1e-9)
+}
+
 /// A locally deformable 2D source lattice. Junctions may move independently,
 /// but every edge remains shared by adjacent cells and row/column ordering is
 /// preserved, preventing gaps, overlaps, and isolated per-cell sampling jumps.
@@ -74,6 +257,8 @@ pub struct FittedLattice {
     nodes: Vec<[f64; 2]>,
     supported: Vec<[bool; 2]>,
     corner_anchors: Vec<bool>,
+    initial_lines: [usize; 2],
+    initialized_corner_nodes: usize,
     columns: usize,
     rows: usize,
     nominal_width: f64,
@@ -99,6 +284,8 @@ impl FittedLattice {
             nodes: nominal.clone(),
             supported: vec![[false; 2]; nominal.len()],
             corner_anchors: vec![false; nominal.len()],
+            initial_lines: [0; 2],
+            initialized_corner_nodes: 0,
             nominal,
             columns,
             rows,
@@ -271,6 +458,9 @@ impl FittedLattice {
             edge_weight: options.edge_weight,
             min_edge_strength: options.min_edge_strength,
             iterations: options.iterations,
+            initial_vertical_lines: self.initial_lines[0],
+            initial_horizontal_lines: self.initial_lines[1],
+            initialized_corner_nodes: self.initialized_corner_nodes,
             fitted_nodes,
             supported_nodes,
             moved_nodes,
@@ -529,6 +719,67 @@ fn corner_evidence(
     let vertical = vertical_edge_strength(integral, lattice, position);
     let horizontal = horizontal_edge_strength(integral, lattice, position);
     (vertical, horizontal, (vertical * horizontal).sqrt())
+}
+
+fn initialize_lattice_from_lines(
+    image: &RgbImage,
+    integral: &IntegralImage,
+    lattice: &mut FittedLattice,
+    options: LatticeOptions,
+) {
+    let detected_x = detect_axis_lines(
+        image,
+        0,
+        lattice.nominal_width,
+        lattice.nominal_height,
+        options.min_edge_strength,
+    );
+    let detected_y = detect_axis_lines(
+        image,
+        1,
+        lattice.nominal_height,
+        lattice.nominal_width,
+        options.min_edge_strength,
+    );
+    lattice.initial_lines = [detected_x.len(), detected_y.len()];
+    if detected_x.is_empty() || detected_y.is_empty() {
+        return;
+    }
+    let completed_x = completed_axis_lines(&detected_x, lattice.nominal_width);
+    let completed_y = completed_axis_lines(&detected_y, lattice.nominal_height);
+    let x_matches: Vec<Option<f64>> = lattice
+        .x_seed
+        .coordinates
+        .iter()
+        .map(|&nominal| nearest_line(&completed_x, nominal, options.radius))
+        .collect();
+    let y_matches: Vec<Option<f64>> = lattice
+        .y_seed
+        .coordinates
+        .iter()
+        .map(|&nominal| nearest_line(&completed_y, nominal, options.radius))
+        .collect();
+    for (row, y_match) in y_matches.iter().enumerate() {
+        let Some(y) = *y_match else { continue };
+        for (column, x_match) in x_matches.iter().enumerate() {
+            let Some(x) = *x_match else { continue };
+            let nominal = lattice.nominal_position(column, row);
+            if !lattice.visible_node(nominal) {
+                continue;
+            }
+            let candidate = [x, y];
+            let (lower, upper) = coordinate_bounds(lattice, column, row);
+            if !candidate_is_valid(candidate, nominal, lower, upper, options.radius) {
+                continue;
+            }
+            let (vertical, horizontal, _) = corner_evidence(integral, lattice, candidate);
+            if vertical >= options.min_edge_strength && horizontal >= options.min_edge_strength {
+                let index = lattice.index(column, row);
+                lattice.nodes[index] = candidate;
+                lattice.initialized_corner_nodes += 1;
+            }
+        }
+    }
 }
 
 fn within_radius(position: [f64; 2], nominal: [f64; 2], radius: f64) -> bool {
@@ -823,12 +1074,19 @@ fn fit_line_axis(
 }
 
 pub fn fit_lattice(
+    image: &RgbImage,
     integral: &IntegralImage,
     grid: Candidate,
     inset: f64,
     options: LatticeOptions,
 ) -> FittedLattice {
     let mut lattice = FittedLattice::regular(grid, integral.width(), integral.height());
+
+    // Seed a rectilinear mesh from coherent, clustered source boundaries and
+    // complete missing lines between reliable corner intersections. This is
+    // adapted from proper-pixel-art's line-first mesh initialization; the
+    // corner-first and distance-weighted local refinements below remain ours.
+    initialize_lattice_from_lines(image, integral, &mut lattice, options);
 
     // First establish reliable 2D anchors from coincident vertical and
     // horizontal evidence. These are the highest-confidence lattice points.
@@ -1061,7 +1319,7 @@ mod tests {
             }
         });
         let integral = IntegralImage::new(&image);
-        let lattice = fit_lattice(&integral, candidate(4.0, 4.0), 0.1, options());
+        let lattice = fit_lattice(&image, &integral, candidate(4.0, 4.0), 0.1, options());
         let corner = lattice.position(2, 1);
         let edge_only = lattice.position(2, 2);
         assert!(distance(corner, [9.0, 4.0]) <= 0.25, "corner: {corner:?}");
@@ -1081,7 +1339,7 @@ mod tests {
             }
         });
         let integral = IntegralImage::new(&image);
-        let lattice = fit_lattice(&integral, candidate(4.0, 4.0), 0.1, options());
+        let lattice = fit_lattice(&image, &integral, candidate(4.0, 4.0), 0.1, options());
         let report = lattice.report(options());
         assert_eq!(report.supported_nodes, 0);
         assert_eq!(report.moved_nodes, 0);
@@ -1091,7 +1349,7 @@ mod tests {
     fn flat_regions_keep_every_junction_on_the_seed_mesh() {
         let image = RgbImage::from_pixel(12, 8, Rgb([32, 32, 32]));
         let integral = IntegralImage::new(&image);
-        let lattice = fit_lattice(&integral, candidate(4.0, 4.0), 0.1, options());
+        let lattice = fit_lattice(&image, &integral, candidate(4.0, 4.0), 0.1, options());
         let report = lattice.report(options());
         assert_eq!(report.supported_nodes, 0);
         assert_eq!(report.moved_nodes, 0);
@@ -1111,7 +1369,7 @@ mod tests {
         let mut strict = options();
         strict.regularization = 0.0;
         strict.edge_weight = 1.0;
-        let lattice = fit_lattice(&integral, candidate(4.0, 4.0), 0.1, strict);
+        let lattice = fit_lattice(&image, &integral, candidate(4.0, 4.0), 0.1, strict);
         let report = lattice.report(strict);
         assert_eq!(report.moved_nodes, 0);
     }
@@ -1126,7 +1384,7 @@ mod tests {
             }
         });
         let integral = IntegralImage::new(&image);
-        let lattice = fit_lattice(&integral, candidate(4.0, 4.0), 0.1, options());
+        let lattice = fit_lattice(&image, &integral, candidate(4.0, 4.0), 0.1, options());
         assert!(lattice.report(options()).max_displacement <= options().radius + 1e-9);
         for cell_y in lattice.cell_y_range() {
             for cell_x in lattice.cell_x_range() {
@@ -1137,5 +1395,60 @@ mod tests {
                 assert!(corners[1][1] < corners[2][1]);
             }
         }
+    }
+
+    #[test]
+    fn line_initializer_seeds_a_shifted_rectilinear_corner_before_refinement() {
+        let x_lines = [0_u32, 4, 9, 13, 17, 21, 24];
+        let y_lines = [0_u32, 4, 9, 13, 16];
+        let image = RgbImage::from_fn(24, 16, |x, y| {
+            let cell_x = x_lines
+                .windows(2)
+                .position(|bounds| x >= bounds[0] && x < bounds[1])
+                .unwrap();
+            let cell_y = y_lines
+                .windows(2)
+                .position(|bounds| y >= bounds[0] && y < bounds[1])
+                .unwrap();
+            if (cell_x + cell_y) % 2 == 0 {
+                Rgb([245, 245, 245])
+            } else {
+                Rgb([15, 15, 15])
+            }
+        });
+        let integral = IntegralImage::new(&image);
+        let mut initializer_only = options();
+        initializer_only.iterations = 0;
+
+        let lattice = fit_lattice(
+            &image,
+            &integral,
+            candidate(4.0, 4.0),
+            0.1,
+            initializer_only,
+        );
+
+        let initialized = lattice.position(2, 2);
+        assert!(distance(initialized, [9.0, 9.0]) <= 0.25, "{initialized:?}");
+        let report = lattice.report(initializer_only);
+        assert!(report.initial_vertical_lines >= 4, "{report:?}");
+        assert!(report.initial_horizontal_lines >= 3, "{report:?}");
+        assert!(report.initialized_corner_nodes > 0, "{report:?}");
+    }
+
+    #[test]
+    fn line_initializer_completes_missing_boundaries_at_nominal_spacing() {
+        let lines = [
+            DetectedLine {
+                coordinate: 4.0,
+                strength: 1.0,
+            },
+            DetectedLine {
+                coordinate: 12.0,
+                strength: 1.0,
+            },
+        ];
+
+        assert_eq!(completed_axis_lines(&lines, 4.0), vec![4.0, 8.0, 12.0]);
     }
 }

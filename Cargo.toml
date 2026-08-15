@@ -1,6 +1,6 @@
 [package]
 name = "pixel-pusher"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 default-run = "pixel-pusher"
 description = "Recover a clean logical pixel grid and palette from imperfect pixel art"

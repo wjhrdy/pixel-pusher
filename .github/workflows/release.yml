@@ -50,7 +50,9 @@ jobs:
         shell: bash
         run: |
           archive="pixel-pusher-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C "target/${{ matrix.target }}/release" "${{ matrix.executable }}" "${{ matrix.gui_executable }}"
+          tar -czf "$archive" \
+            -C "target/${{ matrix.target }}/release" "${{ matrix.executable }}" "${{ matrix.gui_executable }}" \
+            -C "$GITHUB_WORKSPACE" THIRD_PARTY_NOTICES.md
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "$archive.sha256"
           else

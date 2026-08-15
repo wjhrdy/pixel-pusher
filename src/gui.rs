@@ -92,9 +92,10 @@ struct Summary {
     perspective: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Controls {
     automatic: bool,
+    custom_modified: bool,
     min_block: u32,
     max_block: u32,
     max_colors: usize,
@@ -133,6 +134,7 @@ impl Default for Controls {
     fn default() -> Self {
         Self {
             automatic: true,
+            custom_modified: false,
             min_block: 2,
             max_block: 16,
             max_colors: 0,
@@ -437,14 +439,14 @@ impl PixelPusherApp {
                         ui.horizontal(|ui| {
                             let auto = ui
                                 .selectable_label(self.controls.automatic, "Auto")
-                                .on_hover_text("Runs grid scale, fractional squeeze, phase, corner-anchored lattice fitting, palette, and output-scale selection automatically. Corners snap first; nearby row and column points may then follow supported edges. This is the normal starting mode.");
+                                .on_hover_text("Runs grid scale, fractional squeeze, phase, line-seeded and corner-anchored lattice fitting, palette, and output-scale selection automatically. Coherent boundaries initialize corner candidates first; nearby row and column points may then follow supported edges. This is the normal starting mode.");
                             if auto.clicked() {
                                 self.controls.automatic = true;
                                 self.controls.smart_palette = true;
                             }
                             let custom = ui
                                 .selectable_label(!self.controls.automatic, "Custom")
-                                .on_hover_text("Uses the explicit grid and optimization switches below. Choose this when you know the source cell size or want to isolate one pipeline stage.");
+                                .on_hover_text("Starts with the exact Auto pipeline. It switches to the explicit settings below only after you change a control, so selecting Custom by itself does not alter the result.");
                             if custom.clicked() {
                                 self.controls.automatic = false;
                             }
@@ -455,7 +457,7 @@ impl PixelPusherApp {
                         if self.controls.automatic {
                             ui.label(
                                 egui::RichText::new(
-                                    "Auto uses the built-in grid, edge-gated lattice, sampling, and palette search with a default ceiling of 24 colors.",
+                                    "Auto uses the built-in grid, clustered-line lattice initialization, edge-gated local fitting, sampling, and palette search with a default ceiling of 24 colors.",
                                 )
                                 .small()
                                 .color(Color32::from_gray(90)),
@@ -468,6 +470,20 @@ impl PixelPusherApp {
                                 .color(Color32::from_gray(110)),
                             );
                         } else {
+                            let custom_before = self.controls.clone();
+                            ui.label(
+                                egui::RichText::new(if self.controls.custom_modified {
+                                    "Explicit Custom settings are active. Reset defaults to return to the Auto baseline."
+                                } else {
+                                    "Auto baseline is active. Change any control below to create a Custom override."
+                                })
+                                .small()
+                                .color(if self.controls.custom_modified {
+                                    Color32::from_gray(90)
+                                } else {
+                                    TEAL
+                                }),
+                            );
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("Palette limit").strong());
                                 info_badge(ui, "Hard ceiling for indexed-PNG colors. The default allows up to 24 while selecting fewer when appropriate. Common fixed limits are 12–32; use 64–256 only for unusually color-rich art.");
@@ -529,6 +545,9 @@ impl PixelPusherApp {
                             egui::CollapsingHeader::new("Perspective output")
                                 .default_open(false)
                                 .show(ui, |ui| self.perspective_controls(ui));
+                            if self.controls != custom_before {
+                                self.controls.custom_modified = true;
+                            }
                         }
 
                         ui.add_space(10.0);
@@ -1110,7 +1129,7 @@ fn process_image(
     let output = temp.path().join("result.png");
     let mut command = Command::new(processor_executable()?);
     command.arg(path).arg("--output").arg(&output);
-    if controls.automatic {
+    if uses_automatic_pipeline(controls) {
         command.arg("--auto");
     } else {
         if controls.lattice_fit {
@@ -1239,6 +1258,10 @@ fn process_image(
         summary: report_summary(&json),
         stem,
     })
+}
+
+fn uses_automatic_pipeline(controls: &Controls) -> bool {
+    controls.automatic || !controls.custom_modified
 }
 
 fn processor_executable() -> Result<PathBuf, String> {
@@ -1518,6 +1541,21 @@ mod tests {
         assert_eq!(summary.palette_colors, 2);
         assert_eq!(summary.color_picker_overrides, 7);
         assert!(!summary.perspective);
+    }
+
+    #[test]
+    fn untouched_custom_mode_uses_the_automatic_pipeline() {
+        let mut controls = Controls {
+            automatic: false,
+            ..Controls::default()
+        };
+        assert!(uses_automatic_pipeline(&controls));
+
+        controls.custom_modified = true;
+        assert!(!uses_automatic_pipeline(&controls));
+
+        controls.automatic = true;
+        assert!(uses_automatic_pipeline(&controls));
     }
 
     #[test]
