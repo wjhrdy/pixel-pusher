@@ -1,8 +1,8 @@
 class PixelPusher < Formula
   desc "Recover clean pixel grids and compact palettes from imperfect pixel art"
   homepage "https://github.com/wjhrdy/pixel-pusher"
-  url "https://github.com/wjhrdy/pixel-pusher/archive/refs/tags/v0.0.4.tar.gz"
-  sha256 "68b0c06e32f6e089767003c544d48b9414a41a352255880027a58648c43bea68"
+  url "https://github.com/wjhrdy/pixel-pusher/archive/refs/tags/v0.0.5.tar.gz"
+  sha256 "87cf2be40636d47b58ce45cc20c13bb9f065d0767f4923d8fcf620cc33fde53c"
 
   depends_on "rust" => :build
 
