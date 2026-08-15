@@ -46,7 +46,7 @@ struct Args {
     min_block: u32,
 
     /// Largest source-pixel cell dimension to test in both directions.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 32)]
     max_block: u32,
 
     /// Ignore this fraction of each cell on every side (0.0–0.45).

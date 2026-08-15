@@ -190,12 +190,21 @@ fn rank_candidates(
         for candidate in candidates.iter_mut() {
             candidate.edge_alignment = profiles.alignment(*candidate);
             candidate.auto_score = candidate.normalized_residual / candidate.edge_alignment.powi(2)
-                + 1.0 / (candidate.cell_width * candidate.cell_height);
+                + 1.0 / (candidate.cell_width * candidate.cell_height)
+                + aspect_ratio_penalty(*candidate);
         }
         candidates.sort_by(|a, b| a.auto_score.total_cmp(&b.auto_score));
     } else {
         candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
     }
+}
+
+fn aspect_ratio_penalty(candidate: Candidate) -> f64 {
+    // Logical pixel art normally starts from square cells. Keep this prior mild
+    // enough that a clearly better rectangular fit can still recover genuine
+    // global squeeze, while preventing a near-tied divisor from inventing a
+    // large width/height mismatch just to lower its interior residual.
+    0.03 * (candidate.cell_width / candidate.cell_height).ln().abs()
 }
 
 fn reanchor_phase(phase: f64, old_spacing: f64, new_spacing: f64, center: f64) -> f64 {
@@ -500,6 +509,25 @@ mod tests {
         let best = candidates[0];
         assert!((best.cell_width - cell_size).abs() <= 0.11, "{best:?}");
         assert!((best.cell_height - cell_size).abs() <= 0.11, "{best:?}");
+    }
+
+    #[test]
+    fn automatic_ranking_mildly_prefers_square_cells_in_a_close_fit() {
+        let candidate = |cell_width, cell_height| Candidate {
+            cell_width,
+            cell_height,
+            phase_x: 0.0,
+            phase_y: 0.0,
+            score: 0.0,
+            normalized_residual: 0.0,
+            sampled_cells: 1,
+            edge_alignment: 1.0,
+            auto_score: 0.0,
+        };
+
+        assert_eq!(aspect_ratio_penalty(candidate(9.0, 9.0)), 0.0);
+        assert!(aspect_ratio_penalty(candidate(7.4, 8.8)) > 0.005);
+        assert!(aspect_ratio_penalty(candidate(7.3, 8.6)) < 0.006);
     }
 
     #[test]

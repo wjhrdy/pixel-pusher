@@ -136,7 +136,7 @@ impl Default for Controls {
             automatic: true,
             custom_modified: false,
             min_block: 2,
-            max_block: 16,
+            max_block: 32,
             max_colors: 0,
             block_width: 0,
             block_height: 0,
@@ -1424,7 +1424,7 @@ fn parameter_help(label: &str) -> &'static str {
             "Smallest logical-cell dimension tested in source pixels. Lower values find very fine grids but increase search time. Normal: 2–4; default: 2."
         }
         "Max block" => {
-            "Largest logical-cell dimension tested in source pixels. This is a hard search ceiling in both Auto and Custom modes. Raise it for heavily enlarged art. Normal: 16–32; default: 16."
+            "Largest logical-cell dimension tested in source pixels. This is a hard search ceiling in both Auto and Custom modes. Raise it for heavily enlarged art. Normal: 16–32; default: 32."
         }
         "Cell width" => {
             "Forces the source cell width and disables automatic width selection in Custom mode. Use 0 to search. Normal: 0, or approximately 2–32 pixels."

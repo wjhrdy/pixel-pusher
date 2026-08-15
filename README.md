@@ -78,7 +78,7 @@ The native window and file dialogs work on macOS, Windows, and Linux. Processing
 
 Every processing control includes an inline `i` badge. Hover it for a plain-language explanation of the setting, its default or conservative behavior, and the range that is normally useful.
 
-Auto mode selects the fundamental logical-pixel scale using both cell-interior consistency and periodic concentration of source gradients on candidate grid boundaries. It respects `--min-block` and `--max-block` as hard search bounds, refines fractional width, height, and phase, fits the local lattice with scale-derived radius and step settings, compacts the palette, and renders an unsqueezed square-cell output. Only the input path and `--auto` are required.
+Auto mode selects the fundamental logical-pixel scale using both cell-interior consistency and periodic concentration of source gradients on candidate grid boundaries. It searches source-cell dimensions from 2 through 32 pixels by default, treats `--min-block` and `--max-block` as hard bounds, and uses a mild square-cell prior to reject near-tied false squeeze while retaining clearly supported rectangular fits. It then refines fractional width, height, and phase, fits the local lattice with scale-derived radius and step settings, compacts the palette, and renders an unsqueezed square-cell output. Only the input path and `--auto` are required.
 
 The command writes three files next to the input:
 
