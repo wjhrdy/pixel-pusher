@@ -1,20 +1,19 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use image::{ImageReader, Rgb, RgbImage};
+use image::{ImageReader, Rgb};
 use pixel_pusher::{
-    cell_warp::{CellWarpOptions, CellWarpReport, refine_cell_samples},
     color::rgb8,
     geometry::{Quad, estimated_size, rectify},
     grid::{Candidate, EdgeProfiles, SearchOptions, search},
     indexed_png,
     integral::IntegralImage,
+    lattice::{FittedLattice, LatticeFitReport, LatticeOptions, extract_cells, fit_lattice},
     metrics::{OutputMetrics, measure_output},
     palette::{
         CellColor, PaletteSelectionReport, SmartPaletteOptions, cluster, nearest_palette_index,
         select_smart_palette,
     },
     ramp::{RampOptions, RampReport, penalize_one_cell_ramps},
-    warp::{WarpField, WarpOptions, fit_local_warp},
 };
 use serde::Serialize;
 use std::{
@@ -38,7 +37,7 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Automatically select scale, squeeze, phase, palette, and output scale.
+    /// Automatically select scale, squeeze, phase, local lattice, palette, and output scale.
     #[arg(long, conflicts_with_all = ["block", "block_width", "block_height"])]
     auto: bool,
 
@@ -122,57 +121,33 @@ struct Args {
     #[arg(long, requires = "corners")]
     rectified_height: Option<u32>,
 
-    /// Fit a smooth local grid-displacement field after rigid grid detection.
+    /// Fit a locally deformable 2D junction mesh after regular grid detection.
     #[arg(long)]
-    local_warp: bool,
+    lattice_fit: bool,
 
-    /// Source-pixel spacing between local warp control points.
-    #[arg(long, default_value_t = 64)]
-    warp_patch: u32,
+    /// Maximum movement of a fitted lattice junction from the regular-grid seed.
+    #[arg(long, default_value_t = 2.0)]
+    lattice_radius: f64,
 
-    /// Maximum local grid displacement in source pixels.
-    #[arg(long, default_value_t = 1.5)]
-    warp_radius: f64,
-
-    /// Displacement increment used by each local search.
-    #[arg(long, default_value_t = 0.5)]
-    warp_step: f64,
-
-    /// Neighbor regularization strength for the displacement field.
-    #[arg(long, default_value_t = 1.5)]
-    warp_smoothness: f64,
-
-    /// Refine individual source-cell sampling after the smooth local warp.
-    #[arg(long)]
-    cell_warp: bool,
-
-    /// Maximum per-cell residual sampling displacement in source pixels.
-    #[arg(long, default_value_t = 1.5)]
-    cell_warp_radius: f64,
-
-    /// Per-cell residual displacement search increment.
+    /// Subpixel increment used while fitting lattice junctions.
     #[arg(long, default_value_t = 0.25)]
-    cell_warp_step: f64,
+    lattice_step: f64,
 
-    /// Cost that discourages unnecessary per-cell movement.
-    #[arg(long, default_value_t = 0.006)]
-    cell_warp_movement: f64,
+    /// Penalty for neighboring junctions receiving different displacements.
+    #[arg(long, default_value_t = 0.01)]
+    lattice_regularization: f64,
 
-    /// Minimum relative variance reduction required to accept a per-cell shift.
-    #[arg(long, default_value_t = 0.18)]
-    cell_warp_min_improvement: f64,
+    /// Weight given to distinct local color boundaries during lattice fitting.
+    #[arg(long, default_value_t = 0.08)]
+    lattice_edge_weight: f64,
 
-    /// Minimum mixed-color variance required before a cell can shift.
-    #[arg(long, default_value_t = 0.0008)]
-    cell_warp_min_variance: f64,
+    /// Minimum boundary contrast for corners and anchor-guided line fitting.
+    #[arg(long, default_value_t = 0.04)]
+    lattice_min_edge: f64,
 
-    /// Minimum Oklab contrast with a neighboring cell required before shifting.
-    #[arg(long, default_value_t = 0.10)]
-    cell_warp_contrast: f64,
-
-    /// Minimum Oklab neighbor-contrast increase required from a per-cell shift.
-    #[arg(long, default_value_t = 0.015)]
-    cell_warp_min_contrast_gain: f64,
+    /// Alternating horizontal/vertical lattice fitting passes.
+    #[arg(long, default_value_t = 4)]
+    lattice_iterations: u32,
 
     /// Penalty for a one-cell color ramp between high-contrast neighbors; 0 disables it.
     #[arg(long, default_value_t = 0.3)]
@@ -210,8 +185,8 @@ struct Report {
     source_width: u32,
     source_height: u32,
     perspective: Option<PerspectiveReport>,
-    local_warp: Option<WarpReport>,
-    cell_warp: Option<CellWarpReport>,
+    lattice_fit: Option<LatticeFitReport>,
+    color_picker_overrides: usize,
     ramp_cleanup: RampReport,
     selected: Candidate,
     palette: Vec<[u8; 3]>,
@@ -219,16 +194,6 @@ struct Report {
     output_metrics: OutputMetrics,
     candidates: Vec<Candidate>,
     settings: ReportSettings,
-}
-
-#[derive(Serialize)]
-struct WarpReport {
-    patch_size: u32,
-    search_radius: f64,
-    search_step: f64,
-    smoothness: f64,
-    max_displacement: f64,
-    rms_displacement: f64,
 }
 
 #[derive(Serialize)]
@@ -266,106 +231,83 @@ fn suffixed_path(input: &Path, suffix: &str) -> PathBuf {
     input.with_file_name(format!("{stem}{suffix}"))
 }
 
-fn cell_range(phase: f64, block: f64, limit: f64) -> std::ops::Range<i32> {
-    let start = ((-phase) / block).floor() as i32;
-    let end = ((limit - phase) / block).ceil() as i32;
-    start..end
+fn lattice_fit_enabled(automatic: bool, explicitly_enabled: bool) -> bool {
+    automatic || explicitly_enabled
 }
 
-fn extract_cells(integral: &IntegralImage, grid: Candidate, inset: f64) -> Vec<CellColor> {
-    let block_width = grid.cell_width;
-    let block_height = grid.cell_height;
-    let margin_x = block_width * inset;
-    let margin_y = block_height * inset;
-    let mut cells = Vec::new();
-    for cell_y in cell_range(grid.phase_y, block_height, integral.height() as f64) {
-        let outer_y0 = grid.phase_y + cell_y as f64 * block_height;
-        let outer_y1 = outer_y0 + block_height;
-        for cell_x in cell_range(grid.phase_x, block_width, integral.width() as f64) {
-            let outer_x0 = grid.phase_x + cell_x as f64 * block_width;
-            let outer_x1 = outer_x0 + block_width;
-            let x0 = (outer_x0 + margin_x).max(outer_x0.max(0.0));
-            let y0 = (outer_y0 + margin_y).max(outer_y0.max(0.0));
-            let x1 = (outer_x1 - margin_x).min(outer_x1.min(integral.width() as f64));
-            let y1 = (outer_y1 - margin_y).min(outer_y1.min(integral.height() as f64));
-            let moments = if x1 > x0 && y1 > y0 {
-                integral.rect(x0, y0, x1, y1)
-            } else {
-                integral.rect(
-                    outer_x0.max(0.0),
-                    outer_y0.max(0.0),
-                    outer_x1.min(integral.width() as f64),
-                    outer_y1.min(integral.height() as f64),
-                )
-            };
-            if moments.area > 0.0 {
-                cells.push(CellColor {
-                    cell_x,
-                    cell_y,
-                    rgb: moments.mean(),
-                    weight: moments.area,
-                });
+fn draw_line(image: &mut image::RgbImage, start: [f64; 2], end: [f64; 2], color: Rgb<u8>) {
+    let mut x0 = start[0].round() as i32;
+    let mut y0 = start[1].round() as i32;
+    let x1 = end[0].round() as i32;
+    let y1 = end[1].round() as i32;
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    loop {
+        if x0 >= 0 && y0 >= 0 && x0 < image.width() as i32 && y0 < image.height() as i32 {
+            image.put_pixel(x0 as u32, y0 as u32, color);
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let doubled = 2 * error;
+        if doubled >= dy {
+            error += dy;
+            x0 += sx;
+        }
+        if doubled <= dx {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn draw_node(image: &mut image::RgbImage, position: [f64; 2]) {
+    let center_x = position[0].round() as i32;
+    let center_y = position[1].round() as i32;
+    for delta in -2..=2 {
+        for (x, y) in [
+            (center_x + delta, center_y - 2),
+            (center_x + delta, center_y + 2),
+            (center_x - 2, center_y + delta),
+            (center_x + 2, center_y + delta),
+        ] {
+            if x >= 0 && y >= 0 && x < image.width() as i32 && y < image.height() as i32 {
+                image.put_pixel(x as u32, y as u32, Rgb([0, 255, 96]));
             }
         }
     }
+}
+
+fn draw_color_override(image: &mut image::RgbImage, position: [f64; 2]) {
+    let center_x = position[0].round() as i32;
+    let center_y = position[1].round() as i32;
+    for delta in -3..=3 {
+        for (x, y) in [(center_x + delta, center_y), (center_x, center_y + delta)] {
+            if x >= 0 && y >= 0 && x < image.width() as i32 && y < image.height() as i32 {
+                image.put_pixel(x as u32, y as u32, Rgb([0, 230, 255]));
+            }
+        }
+    }
+}
+
+fn find_color_picker_overrides(
+    cells: &[CellColor],
+    assignments: &[usize],
+    regular_colors: &HashMap<(i32, i32), [f64; 3]>,
+    palette: &[[f64; 3]],
+) -> Vec<(i32, i32)> {
     cells
-}
-
-fn extract_warped_cells(
-    image: &RgbImage,
-    grid: Candidate,
-    inset: f64,
-    warp: &WarpField,
-) -> Vec<CellColor> {
-    #[derive(Default)]
-    struct Accumulator {
-        sum: [f64; 3],
-        count: f64,
-    }
-
-    let mut accumulators: HashMap<(i32, i32), Accumulator> = HashMap::new();
-    let block_width = grid.cell_width;
-    let block_height = grid.cell_height;
-    for y in 0..image.height() {
-        for x in 0..image.width() {
-            let center_x = x as f64 + 0.5;
-            let center_y = y as f64 + 0.5;
-            let displacement = warp.displacement(center_x, center_y);
-            let logical_x = (center_x - grid.phase_x - displacement[0]) / block_width;
-            let logical_y = (center_y - grid.phase_y - displacement[1]) / block_height;
-            let fraction_x = logical_x.rem_euclid(1.0);
-            let fraction_y = logical_y.rem_euclid(1.0);
-            if fraction_x < inset
-                || fraction_x > 1.0 - inset
-                || fraction_y < inset
-                || fraction_y > 1.0 - inset
-            {
-                continue;
-            }
-            let accumulator = accumulators
-                .entry((logical_x.floor() as i32, logical_y.floor() as i32))
-                .or_default();
-            let pixel = image.get_pixel(x, y).0;
-            for (sum, value) in accumulator.sum.iter_mut().zip(pixel) {
-                *sum += value as f64 / 255.0;
-            }
-            accumulator.count += 1.0;
-        }
-    }
-    let mut cells: Vec<CellColor> = accumulators
-        .into_iter()
-        .filter(|(_, accumulator)| accumulator.count > 0.0)
-        .map(|((cell_x, cell_y), accumulator)| CellColor {
-            cell_x,
-            cell_y,
-            rgb: accumulator.sum.map(|sum| sum / accumulator.count),
-            weight: accumulator.count,
+        .iter()
+        .zip(assignments)
+        .filter_map(|(cell, &assignment)| {
+            let regular = regular_colors.get(&(cell.cell_x, cell.cell_y))?;
+            (nearest_palette_index(*regular, palette) != assignment)
+                .then_some((cell.cell_x, cell.cell_y))
         })
-        .collect();
-    // Palette threshold merging is intentionally incremental, so stabilize
-    // cell order rather than inheriting randomized HashMap iteration order.
-    cells.sort_by_key(|cell| (cell.cell_y, cell.cell_x));
-    cells
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -379,6 +321,7 @@ fn main() -> Result<()> {
         .as_ref()
         .context("an input image is required unless --gui is used")?;
     let automatic = args.auto;
+    let use_lattice_fit = lattice_fit_enabled(automatic, args.lattice_fit);
     if args.min_block < 1 || args.max_block < args.min_block {
         bail!("block range must satisfy 1 <= min-block <= max-block");
     }
@@ -408,25 +351,16 @@ fn main() -> Result<()> {
             "palette settings require max-colors in 1..=256, candidate-max >= 2, and nonnegative penalty/edge emphasis"
         );
     }
-    if args.local_warp
-        && (args.warp_patch < 8
-            || args.warp_radius <= 0.0
-            || args.warp_step <= 0.0
-            || args.warp_smoothness < 0.0)
-    {
-        bail!("warp settings require patch >= 8, radius/step > 0, and smoothness >= 0");
-    }
-    if args.cell_warp
-        && (args.cell_warp_radius <= 0.0
-            || args.cell_warp_step <= 0.0
-            || args.cell_warp_movement < 0.0
-            || !(0.0..1.0).contains(&args.cell_warp_min_improvement)
-            || args.cell_warp_min_variance < 0.0
-            || args.cell_warp_contrast <= 0.0
-            || args.cell_warp_min_contrast_gain < 0.0)
+    if use_lattice_fit
+        && (args.lattice_radius <= 0.0
+            || args.lattice_step <= 0.0
+            || args.lattice_regularization < 0.0
+            || args.lattice_edge_weight < 0.0
+            || !(0.0..=1.0).contains(&args.lattice_min_edge)
+            || args.lattice_iterations == 0)
     {
         bail!(
-            "cell-warp settings require radius/step/contrast > 0, nonnegative movement/variance, and improvement in [0, 1)"
+            "lattice settings require radius/step > 0, nonnegative regularization/edge weight, min-edge in [0, 1], and at least one iteration"
         );
     }
     if args.ramp_penalty < 0.0
@@ -484,44 +418,31 @@ fn main() -> Result<()> {
         .first()
         .context("grid search produced no candidates")?;
     let recovered_scale = (selected.cell_width * selected.cell_height).sqrt();
-    let effective_warp_patch = if automatic {
-        (recovered_scale * 4.0).round().max(8.0) as u32
+    let effective_lattice_radius = if automatic {
+        (recovered_scale * 0.6).clamp(1.0, 6.0)
     } else {
-        args.warp_patch
+        args.lattice_radius
     };
-    let effective_warp_radius = if automatic {
-        (recovered_scale * 0.24).clamp(1.0, 6.0)
+    let effective_lattice_step = if automatic {
+        (recovered_scale / 24.0).clamp(0.1, 0.5)
     } else {
-        args.warp_radius
+        args.lattice_step
     };
-    let effective_warp_step = if automatic {
-        (recovered_scale / 36.0).clamp(0.25, 1.0)
+    let lattice_options = LatticeOptions {
+        radius: effective_lattice_radius,
+        step: effective_lattice_step,
+        regularization: args.lattice_regularization,
+        edge_weight: args.lattice_edge_weight,
+        min_edge_strength: args.lattice_min_edge,
+        iterations: args.lattice_iterations,
+    };
+    let lattice = if use_lattice_fit {
+        fit_lattice(&integral, selected, effective_inset, lattice_options)
     } else {
-        args.warp_step
+        FittedLattice::regular(selected, integral.width(), integral.height())
     };
-    let effective_warp_smoothness = if automatic {
-        1.25
-    } else {
-        args.warp_smoothness
-    };
-    let warp = args.local_warp.then(|| {
-        fit_local_warp(
-            &integral,
-            selected,
-            effective_inset,
-            WarpOptions {
-                patch_size: effective_warp_patch,
-                radius: effective_warp_radius,
-                step: effective_warp_step,
-                smoothness: effective_warp_smoothness,
-            },
-        )
-    });
-    let baseline_cells = if let Some(warp) = &warp {
-        extract_warped_cells(&image, selected, effective_inset, warp)
-    } else {
-        extract_cells(&integral, selected, effective_inset)
-    };
+    let lattice_report = use_lattice_fit.then(|| lattice.report(lattice_options));
+    let cells = extract_cells(&image, &integral, &lattice, effective_inset);
     // Indexed PNG permits at most 256 entries. Keep the default compact in
     // both modes while allowing an explicit larger ceiling when requested.
     let effective_max_color_count = args.max_colors.unwrap_or(24);
@@ -529,7 +450,7 @@ fn main() -> Result<()> {
     let use_smart_palette = automatic || args.smart_palette;
     let (palette, mut assignments, palette_selection) = if use_smart_palette {
         let selection = select_smart_palette(
-            &baseline_cells,
+            &cells,
             SmartPaletteOptions {
                 candidate_max: args.palette_candidate_max,
                 max_colors: effective_max_color_count,
@@ -544,49 +465,9 @@ fn main() -> Result<()> {
             Some(selection.report),
         )
     } else {
-        let (palette, assignments) =
-            cluster(&baseline_cells, args.merge_threshold, effective_max_colors);
+        let (palette, assignments) = cluster(&cells, args.merge_threshold, effective_max_colors);
         (palette, assignments, None)
     };
-    let effective_cell_warp_radius = if automatic {
-        (recovered_scale * 0.18).clamp(0.75, 2.5)
-    } else {
-        args.cell_warp_radius
-    };
-    let effective_cell_warp_step = if automatic {
-        (recovered_scale / 32.0).clamp(0.2, 0.5)
-    } else {
-        args.cell_warp_step
-    };
-    let cell_warp = args.cell_warp.then(|| {
-        refine_cell_samples(
-            &baseline_cells,
-            &integral,
-            selected,
-            effective_inset,
-            warp.as_ref(),
-            CellWarpOptions {
-                radius: effective_cell_warp_radius,
-                step: effective_cell_warp_step,
-                movement_penalty: args.cell_warp_movement,
-                min_improvement: args.cell_warp_min_improvement,
-                min_variance: args.cell_warp_min_variance,
-                contrast_threshold: args.cell_warp_contrast,
-                min_contrast_gain: args.cell_warp_min_contrast_gain,
-            },
-        )
-    });
-    let cells = cell_warp
-        .as_ref()
-        .map(|result| result.cells.clone())
-        .unwrap_or(baseline_cells);
-    if let Some(refinement) = &cell_warp {
-        for (index, cell) in cells.iter().enumerate() {
-            if refinement.offsets.contains_key(&(cell.cell_x, cell.cell_y)) {
-                assignments[index] = nearest_palette_index(cell.rgb, &palette);
-            }
-        }
-    }
     let ramp_cleanup = penalize_one_cell_ramps(
         &cells,
         &palette,
@@ -599,10 +480,18 @@ fn main() -> Result<()> {
             max_passes: args.ramp_passes,
         },
     );
+    let regular_lattice = FittedLattice::regular(selected, integral.width(), integral.height());
+    let regular_colors: HashMap<(i32, i32), [f64; 3]> =
+        extract_cells(&image, &integral, &regular_lattice, effective_inset)
+            .into_iter()
+            .map(|cell| ((cell.cell_x, cell.cell_y), cell.rgb))
+            .collect();
+    let color_picker_overrides =
+        find_color_picker_overrides(&cells, &assignments, &regular_colors, &palette);
     let cell_palette: HashMap<(i32, i32), usize> = cells
         .iter()
-        .zip(assignments)
-        .map(|(cell, assignment)| ((cell.cell_x, cell.cell_y), assignment))
+        .zip(&assignments)
+        .map(|(cell, &assignment)| ((cell.cell_x, cell.cell_y), assignment))
         .collect();
 
     let block_width = selected.cell_width;
@@ -610,8 +499,8 @@ fn main() -> Result<()> {
     let output_block = args
         .output_block
         .unwrap_or_else(|| (block_width * block_height).sqrt().round().max(1.0) as u32);
-    let output_cells_x = cell_range(selected.phase_x, block_width, image.width() as f64);
-    let output_cells_y = cell_range(selected.phase_y, block_height, image.height() as f64);
+    let output_cells_x = lattice.cell_x_range();
+    let output_cells_y = lattice.cell_y_range();
     let output_width = (output_cells_x.end - output_cells_x.start) as u32 * output_block;
     let output_height = (output_cells_y.end - output_cells_y.start) as u32 * output_block;
     let output_metrics = measure_output(
@@ -637,7 +526,7 @@ fn main() -> Result<()> {
             let output_cells_x = output_cells_x.clone();
             let output_cells_y = output_cells_y.clone();
             (0..output_width).map(move |x| {
-                // Source squeeze and local deformation affect identification only.
+                // Source squeeze and lattice fitting affect identification only.
                 // Every recovered logical cell is repainted as an exact output square.
                 let cell_x = output_cells_x.start + (x / output_block) as i32;
                 let cell_y = output_cells_y.start + (y / output_block) as i32;
@@ -654,48 +543,18 @@ fn main() -> Result<()> {
     )?;
 
     let mut overlay = image.clone();
-    for y in 0..overlay.height() {
-        for x in 0..overlay.width() {
-            let center_x = x as f64 + 0.5;
-            let center_y = y as f64 + 0.5;
-            let displacement = warp
-                .as_ref()
-                .map(|field| field.displacement(center_x, center_y))
-                .unwrap_or([0.0, 0.0]);
-            let dx = (center_x - selected.phase_x - displacement[0]).rem_euclid(block_width);
-            let dy = (center_y - selected.phase_y - displacement[1]).rem_euclid(block_height);
-            if dx.min(block_width - dx) < 0.65 || dy.min(block_height - dy) < 0.65 {
-                let source = overlay.get_pixel(x, y).0;
-                overlay.put_pixel(
-                    x,
-                    y,
-                    Rgb([
-                        (source[0] as u16 / 2 + 127) as u8,
-                        (source[1] as u16 / 2) as u8,
-                        (source[2] as u16 / 2) as u8,
-                    ]),
-                );
-            }
-        }
+    for (start, end) in lattice.mesh_segments() {
+        draw_line(&mut overlay, start, end, Rgb([225, 48, 48]));
     }
-    if let Some(refinement) = &cell_warp {
-        for (&(cell_x, cell_y), &residual) in &refinement.offsets {
-            let nominal_x = selected.phase_x + (cell_x as f64 + 0.5) * block_width;
-            let nominal_y = selected.phase_y + (cell_y as f64 + 0.5) * block_height;
-            let smooth = warp
-                .as_ref()
-                .map(|field| field.displacement(nominal_x, nominal_y))
-                .unwrap_or([0.0; 2]);
-            let sample_x = (nominal_x + smooth[0] + residual[0]).round() as i32;
-            let sample_y = (nominal_y + smooth[1] + residual[1]).round() as i32;
-            for delta in -2..=2 {
-                for (x, y) in [(sample_x + delta, sample_y), (sample_x, sample_y + delta)] {
-                    if x >= 0 && y >= 0 && x < overlay.width() as i32 && y < overlay.height() as i32
-                    {
-                        overlay.put_pixel(x as u32, y as u32, Rgb([0, 255, 255]));
-                    }
-                }
-            }
+    for (start, end) in lattice.supported_segments() {
+        draw_line(&mut overlay, start, end, Rgb([24, 24, 24]));
+    }
+    for node in lattice.supported_nodes() {
+        draw_node(&mut overlay, node);
+    }
+    for &(cell_x, cell_y) in &color_picker_overrides {
+        if let Some(center) = lattice.cell_center(cell_x, cell_y) {
+            draw_color_override(&mut overlay, center);
         }
     }
     let overlay_path = suffixed_path(&output, ".grid.png");
@@ -718,15 +577,8 @@ fn main() -> Result<()> {
         source_width: source.width(),
         source_height: source.height(),
         perspective,
-        local_warp: warp.as_ref().map(|field| WarpReport {
-            patch_size: effective_warp_patch,
-            search_radius: effective_warp_radius,
-            search_step: effective_warp_step,
-            smoothness: effective_warp_smoothness,
-            max_displacement: field.max_displacement(),
-            rms_displacement: field.rms_displacement(),
-        }),
-        cell_warp: cell_warp.as_ref().map(|result| result.report),
+        lattice_fit: lattice_report,
+        color_picker_overrides: color_picker_overrides.len(),
         ramp_cleanup,
         selected,
         palette: palette_rgb8,
@@ -798,17 +650,58 @@ fn main() -> Result<()> {
             selected.auto_score, selected.edge_alignment
         );
     }
-    if let Some(refinement) = &cell_warp {
+    if let Some(fit) = &report.lattice_fit {
         println!(
-            "per-cell sampling: {} of {} eligible cells shifted, RMS {:.3} px, max {:.3} px",
-            refinement.report.shifted_cells,
-            refinement.report.eligible_cells,
-            refinement.report.rms_displacement,
-            refinement.report.max_displacement,
+            "lattice fit: {} corner anchors, {} junctions moved, RMS {:.3} px, max {:.3} px",
+            fit.supported_nodes, fit.moved_nodes, fit.rms_displacement, fit.max_displacement,
         );
     }
+    println!(
+        "color picker overrides: {} cells",
+        color_picker_overrides.len()
+    );
     println!("corrected: {}", output.display());
     println!("grid overlay: {}", overlay_path.display());
     println!("report: {}", report_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_color_picker_overrides, lattice_fit_enabled};
+    use pixel_pusher::palette::CellColor;
+    use std::collections::HashMap;
+
+    #[test]
+    fn auto_mode_always_enables_lattice_fitting() {
+        assert!(lattice_fit_enabled(true, false));
+        assert!(lattice_fit_enabled(true, true));
+        assert!(lattice_fit_enabled(false, true));
+        assert!(!lattice_fit_enabled(false, false));
+    }
+
+    #[test]
+    fn color_picker_overrides_compare_final_and_regular_palette_choices() {
+        let cells = vec![
+            CellColor {
+                cell_x: 2,
+                cell_y: 3,
+                rgb: [0.95, 0.95, 0.95],
+                weight: 1.0,
+            },
+            CellColor {
+                cell_x: 3,
+                cell_y: 3,
+                rgb: [0.05, 0.05, 0.05],
+                weight: 1.0,
+            },
+        ];
+        let regular_colors =
+            HashMap::from([((2, 3), [0.05, 0.05, 0.05]), ((3, 3), [0.05, 0.05, 0.05])]);
+        let palette = [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]];
+
+        let overrides = find_color_picker_overrides(&cells, &[1, 0], &regular_colors, &palette);
+
+        assert_eq!(overrides, vec![(2, 3)]);
+    }
 }

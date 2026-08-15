@@ -4,11 +4,11 @@ Pixel Pusher is an experimental Rust CLI for recovering clean, grid-aligned pixe
 
 It searches logical-pixel widths, heights, and grid phases independently, including fractional source-pixel dimensions and offsets. Cells can therefore fit a source that has been slightly squeezed or stretched along one axis—for example, a `4.12 × 3.84` source grid. Each candidate is scored by the color variance *inside* its cells. A configurable inset excludes anti-aliased or misaligned borders from both scoring and final color estimation. Auto mode generates several edge-aware palette candidates in Oklab, then balances reconstruction error against palette complexity.
 
-The output is always rendered onto a new, rigid lattice of exact square pixels. Fractional squeeze, perspective correction, and local warp affect source sampling only; they never produce subpixels or warped boundaries in the result.
+The output is always rendered onto a new, rigid lattice of exact square pixels. Fractional squeeze, perspective correction, and optional non-uniform source-lattice fitting affect source sampling only; they never produce subpixels or irregular boundaries in the result.
 
 ## Features
 
-- Automatic logical-pixel scale, x/y phase, fractional squeeze, palette, and output-scale selection
+- Automatic logical-pixel scale, x/y phase, fractional squeeze, edge-gated lattice fitting, palette, and output-scale selection
 - Independent source cell width and height with square output reconstruction
 - Fractional-area RGB/RGB² sampling through summed-area tables
 - Edge-aware, histogram-peak-seeded, hue-preserving Oklab palette candidates with automatic color-count selection
@@ -16,6 +16,7 @@ The output is always rendered onto a new, rigid lattice of exact square pixels. 
 - Compact indexed-color PNG output using 1, 2, 4, or 8 bits per pixel
 - One-cell color-ramp suppression with source-fidelity protection
 - Optional four-corner perspective rectification for photographed art
+- Optional edge-weighted non-uniform lattice fitting for globally inconsistent source alignment
 - Perceptual output metrics for edge strength, weak transitions, and crispness
 - PNG, JPEG, and WebP input
 - Native drag-and-drop desktop app with OS file dialogs and four-corner editing
@@ -67,17 +68,17 @@ pixel-pusher --gui
 pixel-pusher-gui
 ```
 
-Drop in a PNG, JPEG, or WebP image, then save the corrected indexed PNG, detected-grid overlay, or JSON report through the operating system's file dialog. Auto mode deliberately has no configuration: it selects the regular grid, squeeze, palette, and output scale from built-in defaults. Choose Custom to expose the palette, grid, sampling, warp, edge, forced-cell, and perspective controls. You can open an image immediately with `pixel-pusher-gui input.png` or `pixel-pusher input.png --gui`.
+Drop in a PNG, JPEG, or WebP image, then save the corrected indexed PNG, detected-grid overlay, or JSON report through the operating system's file dialog. Auto mode deliberately has no configuration: it selects the regular grid, squeeze, edge-gated local lattice, palette, and output scale from built-in defaults. Choose Custom to expose the palette, grid, sampling, lattice, edge, forced-cell, and perspective controls. You can open an image immediately with `pixel-pusher-gui input.png` or `pixel-pusher input.png --gui`.
 
-After processing, the input preview switches to the detected-grid visualization, with recovered boundaries in red and locally shifted samples in cyan. Toggle back to the original whenever you want to adjust perspective corners. The corrected square-pixel output remains visible directly below the input in the same scrollable workspace. All three previews render at 100% stored-pixel dimensions with nearest sampling; oversized images scroll instead of being fit or rescaled.
+After processing, the input preview switches to the detected-grid visualization. The complete fitted mesh is red; dark segments identify locally supported boundaries, green squares mark high-confidence corner anchors with both horizontal and vertical evidence, and cyan crosses mark cells whose final palette choice differs from regular-grid sampling. Toggle back to the original whenever you want to adjust perspective corners. The corrected square-pixel output remains visible directly below the input in the same scrollable workspace. All three previews render at 100% stored-pixel dimensions with nearest sampling; oversized images scroll instead of being fit or rescaled.
 
-For a rotated photograph or perspective-skewed capture, enable **Correct perspective** and drag the numbered handles to the source artwork's top-left, top-right, bottom-right, and bottom-left corners. Perspective rectification and local warp only alter source sampling. The downloaded image remains a rigid lattice of square pixels.
+For a rotated photograph or perspective-skewed capture, enable **Correct perspective** and drag the numbered handles to the source artwork's top-left, top-right, bottom-right, and bottom-left corners. Perspective rectification and source-lattice fitting only alter sampling. The downloaded image remains a rigid lattice of square pixels.
 
 The native window and file dialogs work on macOS, Windows, and Linux. Processing runs in a background thread on the same computer, and the existing command-line interface remains available for scripts and batch jobs.
 
 Every processing control includes an inline `i` badge. Hover it for a plain-language explanation of the setting, its default or conservative behavior, and the range that is normally useful.
 
-Auto mode selects the fundamental logical-pixel scale using both cell-interior consistency and periodic concentration of source gradients on candidate grid boundaries. It respects `--min-block` and `--max-block` as hard search bounds, refines fractional width, height, and phase, compacts the palette, and renders an unsqueezed square-cell output. Only the input path and `--auto` are required.
+Auto mode selects the fundamental logical-pixel scale using both cell-interior consistency and periodic concentration of source gradients on candidate grid boundaries. It respects `--min-block` and `--max-block` as hard search bounds, refines fractional width, height, and phase, fits the local lattice with scale-derived radius and step settings, compacts the palette, and renders an unsqueezed square-cell output. Only the input path and `--auto` are required.
 
 The command writes three files next to the input:
 
@@ -159,25 +160,27 @@ Pixel Pusher estimates a rectified width and height from the four sides, maps th
 
 This follows the geometry/sampling separation used in QR readers, but does not assume that pixel art contains QR-style finder patterns. Automatic quadrilateral and periodic-grid detection is not yet included; the four corners are the current seed for perspective recovery.
 
-## Locally irregular grids
+## Non-uniform source lattices
 
-For generated art whose logical-pixel alignment drifts across the image, enable the regularized local warp:
+For generated art whose logical-pixel alignment drifts across the image, enable edge-weighted lattice fitting:
 
 ```sh
-pixel-pusher input.png --block 4 --local-warp --inset 0.18
+pixel-pusher input.png --block 4 --lattice-fit --inset 0.18
 ```
 
-The image is covered by a coarse control mesh. Each control point searches a small neighborhood for the phase with the lowest mean inset cell variance. The displacement field is then smoothed across neighboring controls. This lets the *input sampling regions* bend gradually toward local separations without allowing the regional grid to tear.
+This follows the [lattice-fitting motivation described here](https://www.reddit.com/r/aigamedev/comments/1u9etqa/comment/p2x7zzp/?context=3): locally grid-like regions can still disagree globally, so fitting one uniform phase is not always enough.
 
-The main controls are `--warp-patch` (control spacing), `--warp-radius` (maximum displacement), `--warp-step`, and `--warp-smoothness`.
+The regular grid supplies a topologically stable 2D seed mesh. Fitting happens hierarchically. First, a joint 2D search snaps high-confidence corners where vertical and horizontal boundary evidence coincide. Then edge-only points may refine one axis only when snapped corner anchors exist in the same logical row or column. Anchor influence decays with lattice distance, so nearby corners matter more than distant ones. The four neighboring cells provide fit quality and displacement regularization keeps the mesh coherent. Every mesh edge remains shared by adjacent cells, preventing gaps, overlaps, and isolated per-cell sampling jumps.
 
-The optional per-cell residual search considers only internally mixed cells next to a high-contrast neighbor, and accepts a shift only when it both materially reduces inset variance and increases neighbor contrast after a movement penalty. This can align a tooth, highlight, or other one-logical-pixel feature without moving an entire local patch. Enable it explicitly with `--cell-warp`; tune it with `--cell-warp-radius`, `--cell-warp-step`, `--cell-warp-movement`, `--cell-warp-min-improvement`, `--cell-warp-min-variance`, `--cell-warp-contrast`, and `--cell-warp-min-contrast-gain`. Cyan crosses in the grid overlay mark cells whose sampling centers shifted. Both warp stages are disabled by default because rigid sampling is more predictable for most artwork.
+Edge evidence is local and contrast-weighted: strong, distinct pixel boundaries carry most of the vote, while flat and low-detail neighborhoods contribute little. A corner cannot become an anchor unless both axes exceed `--lattice-min-edge`. A point on only a vertical or horizontal boundary can still snap, but only during the second pass and only when corner anchors in its column or row support that motion. Strong unanchored edges therefore cannot deform the mesh by themselves.
 
-Neither warp is used for output geometry: estimated colors are always painted back onto the original rigid, axis-aligned logical grid, so curved or subpixel cell boundaries cannot appear in the corrected image.
+The main controls are `--lattice-radius` (maximum movement), `--lattice-step`, `--lattice-regularization`, `--lattice-edge-weight`, `--lattice-min-edge`, and `--lattice-iterations`. Lattice fitting runs automatically in Auto mode; in Custom mode it remains controlled by `--lattice-fit` so rigid-grid comparisons are still available.
+
+Fitted quadrilateral cells are sampled through bilinear coordinates, but the source mesh is not used for output geometry: estimated colors are always painted onto a new rigid, axis-aligned logical grid, so non-uniform or subpixel cell boundaries cannot appear in the corrected image.
 
 ## Current proof-of-concept limits
 
-- It assumes an axis-aligned, regularly spaced grid; width and height are independent.
+- It assumes an approximately axis-aligned seed grid; optional lattice fitting can move local junctions and bend shared mesh edges, but it is not a replacement for coarse rotation or perspective correction.
 - It searches fractional source cell dimensions and x/y phase offsets; output cells remain integer squares.
 - Perspective and rotation are handled from four supplied corners, including draggable handles in the local UI; automatic corner detection is not yet included.
 - Palette membership is global, although topology-derived edge weights protect rare outlines and highlights. Region-specific palettes are not yet modeled.
@@ -190,4 +193,4 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The test suite covers fractional sampling, grid and squeeze recovery, homography mapping, local-warp interpolation, edge-aware palette selection, one-cell ramp handling, and scale-independent output metrics.
+The test suite covers fractional sampling, grid and squeeze recovery, homography mapping, edge-gated non-uniform lattice fitting, edge-aware palette selection, one-cell ramp handling, and scale-independent output metrics.

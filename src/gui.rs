@@ -42,11 +42,17 @@ struct PixelPusherApp {
     source: Option<SourceImage>,
     result: Option<ProcessedResult>,
     pending: Option<Receiver<Result<ProcessedPayload, String>>>,
+    dialog_pending: Option<Receiver<DialogResult>>,
     controls: Controls,
     status: String,
     error: bool,
     show_overlay: bool,
     dragging_corner: Option<usize>,
+}
+
+enum DialogResult {
+    Open(Option<PathBuf>),
+    Saved(Result<Option<PathBuf>, String>),
 }
 
 struct SourceImage {
@@ -80,6 +86,7 @@ struct Summary {
     source_grid: String,
     output_size: String,
     palette_colors: usize,
+    color_picker_overrides: u64,
     bit_depth: u64,
     fit_score: f64,
     perspective: bool,
@@ -102,19 +109,13 @@ struct Controls {
     perspective: bool,
     rectified_width: u32,
     rectified_height: u32,
-    local_warp: bool,
-    warp_patch: u32,
-    warp_radius: f64,
-    warp_step: f64,
-    warp_smoothness: f64,
-    cell_warp: bool,
-    cell_warp_radius: f64,
-    cell_warp_step: f64,
-    cell_warp_movement: f64,
-    cell_warp_min_improvement: f64,
-    cell_warp_min_variance: f64,
-    cell_warp_contrast: f64,
-    cell_warp_min_contrast_gain: f64,
+    lattice_fit: bool,
+    lattice_radius: f64,
+    lattice_step: f64,
+    lattice_regularization: f64,
+    lattice_edge_weight: f64,
+    lattice_min_edge: f64,
+    lattice_iterations: u32,
     smart_palette: bool,
     palette_candidate_max: usize,
     merge_threshold: f64,
@@ -146,19 +147,13 @@ impl Default for Controls {
             perspective: false,
             rectified_width: 0,
             rectified_height: 0,
-            local_warp: false,
-            warp_patch: 64,
-            warp_radius: 1.5,
-            warp_step: 0.5,
-            warp_smoothness: 1.5,
-            cell_warp: false,
-            cell_warp_radius: 1.5,
-            cell_warp_step: 0.25,
-            cell_warp_movement: 0.006,
-            cell_warp_min_improvement: 0.18,
-            cell_warp_min_variance: 0.0008,
-            cell_warp_contrast: 0.10,
-            cell_warp_min_contrast_gain: 0.015,
+            lattice_fit: false,
+            lattice_radius: 2.0,
+            lattice_step: 0.25,
+            lattice_regularization: 0.01,
+            lattice_edge_weight: 0.08,
+            lattice_min_edge: 0.04,
+            lattice_iterations: 4,
             smart_palette: true,
             palette_candidate_max: 12,
             merge_threshold: 0.035,
@@ -190,6 +185,7 @@ impl PixelPusherApp {
             source: None,
             result: None,
             pending: None,
+            dialog_pending: None,
             controls: Controls::default(),
             status: "Drop an image or choose a file to begin.".to_owned(),
             error: false,
@@ -298,10 +294,79 @@ impl PixelPusherApp {
         }
     }
 
-    fn handle_dropped_files(&mut self, context: &egui::Context) {
+    fn handle_dropped_files(&mut self, context: &egui::Context) -> bool {
         let files = context.input(|input| input.raw.dropped_files.clone());
         if let Some(path) = files.into_iter().find_map(|file| file.path) {
             self.open_image(context, path);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn begin_pick_image(&mut self, context: &egui::Context) {
+        if self.dialog_pending.is_some() {
+            return;
+        }
+        let future = rfd::AsyncFileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+            .pick_file();
+        let (sender, receiver) = mpsc::channel();
+        let repaint = context.clone();
+        std::thread::spawn(move || {
+            let path = pollster::block_on(future).map(|file| file.path().to_path_buf());
+            let _ = sender.send(DialogResult::Open(path));
+            repaint.request_repaint();
+        });
+        self.dialog_pending = Some(receiver);
+    }
+
+    fn begin_save_artifact(
+        &mut self,
+        context: &egui::Context,
+        bytes: Vec<u8>,
+        filename: String,
+        label: &'static str,
+        extensions: &'static [&'static str],
+    ) {
+        if self.dialog_pending.is_some() {
+            return;
+        }
+        let future = rfd::AsyncFileDialog::new()
+            .add_filter(label, extensions)
+            .set_file_name(filename)
+            .save_file();
+        let (sender, receiver) = mpsc::channel();
+        let repaint = context.clone();
+        std::thread::spawn(move || {
+            let result = pollster::block_on(future).map_or(Ok(None), |file| {
+                let path = file.path().to_path_buf();
+                std::fs::write(&path, bytes)
+                    .map(|()| Some(path))
+                    .map_err(|error| error.to_string())
+            });
+            let _ = sender.send(DialogResult::Saved(result));
+            repaint.request_repaint();
+        });
+        self.dialog_pending = Some(receiver);
+    }
+
+    fn poll_dialog(&mut self, context: &egui::Context) {
+        let received = self
+            .dialog_pending
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        let Some(result) = received else { return };
+        self.dialog_pending = None;
+        match result {
+            DialogResult::Open(Some(path)) => self.open_image(context, path),
+            DialogResult::Open(None) | DialogResult::Saved(Ok(None)) => {}
+            DialogResult::Saved(Ok(Some(path))) => {
+                self.set_status(format!("Saved {}", path.display()), false);
+            }
+            DialogResult::Saved(Err(error)) => {
+                self.set_status(format!("Could not save file: {error}"), true);
+            }
         }
     }
 
@@ -372,7 +437,7 @@ impl PixelPusherApp {
                         ui.horizontal(|ui| {
                             let auto = ui
                                 .selectable_label(self.controls.automatic, "Auto")
-                                .on_hover_text("Runs grid scale, fractional squeeze, phase, palette, and output-scale selection automatically. Warp stages remain optional because they can add local noise. This is the normal starting mode.");
+                                .on_hover_text("Runs grid scale, fractional squeeze, phase, corner-anchored lattice fitting, palette, and output-scale selection automatically. Corners snap first; nearby row and column points may then follow supported edges. This is the normal starting mode.");
                             if auto.clicked() {
                                 self.controls.automatic = true;
                                 self.controls.smart_palette = true;
@@ -390,7 +455,7 @@ impl PixelPusherApp {
                         if self.controls.automatic {
                             ui.label(
                                 egui::RichText::new(
-                                    "Auto uses the built-in grid, sampling, and palette search with a default ceiling of 24 colors.",
+                                    "Auto uses the built-in grid, edge-gated lattice, sampling, and palette search with a default ceiling of 24 colors.",
                                 )
                                 .small()
                                 .color(Color32::from_gray(90)),
@@ -455,9 +520,9 @@ impl PixelPusherApp {
                             egui::CollapsingHeader::new("Grid & sampling")
                                 .default_open(false)
                                 .show(ui, |ui| self.grid_controls(ui));
-                            egui::CollapsingHeader::new("Local warp")
+                            egui::CollapsingHeader::new("Lattice fitting")
                                 .default_open(false)
-                                .show(ui, |ui| self.warp_controls(ui));
+                                .show(ui, |ui| self.lattice_controls(ui));
                             egui::CollapsingHeader::new("Palette & edges")
                                 .default_open(false)
                                 .show(ui, |ui| self.palette_controls(ui));
@@ -494,32 +559,38 @@ impl PixelPusherApp {
                         if let Some(result) = &self.result {
                             ui.separator();
                             ui.label(egui::RichText::new("Export").strong());
+                            let mut save_request = None;
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button("Save PNG…").clicked() {
-                                    save_artifact(
-                                        &result.corrected,
-                                        &format!("{}.aligned.png", result.stem),
+                                    save_request = Some((
+                                        result.corrected.clone(),
+                                        format!("{}.aligned.png", result.stem),
                                         "PNG",
-                                        &["png"],
-                                    );
+                                        &["png"][..],
+                                    ));
                                 }
                                 if ui.button("Save grid…").clicked() {
-                                    save_artifact(
-                                        &result.overlay,
-                                        &format!("{}.grid.png", result.stem),
+                                    save_request = Some((
+                                        result.overlay.clone(),
+                                        format!("{}.grid.png", result.stem),
                                         "PNG",
-                                        &["png"],
-                                    );
+                                        &["png"][..],
+                                    ));
                                 }
                                 if ui.button("Save report…").clicked() {
-                                    save_artifact(
-                                        &result.report,
-                                        &format!("{}.report.json", result.stem),
+                                    save_request = Some((
+                                        result.report.clone(),
+                                        format!("{}.report.json", result.stem),
                                         "JSON",
-                                        &["json"],
-                                    );
+                                        &["json"][..],
+                                    ));
                                 }
                             });
+                            if let Some((bytes, filename, label, extensions)) = save_request {
+                                self.begin_save_artifact(
+                                    context, bytes, filename, label, extensions,
+                                );
+                            }
                         }
                     });
             });
@@ -569,100 +640,60 @@ impl PixelPusherApp {
         });
     }
 
-    fn warp_controls(&mut self, ui: &mut egui::Ui) {
+    fn lattice_controls(&mut self, ui: &mut egui::Ui) {
         checkbox_with_help(
             ui,
-            &mut self.controls.local_warp,
-            "Smooth local sampling warp",
-            "Fits a regularized displacement field so source sampling follows gradual local grid drift. Normally off because it can add noise; enable it only when a rigid grid visibly drifts across the image.",
+            &mut self.controls.lattice_fit,
+            "Fit non-uniform source lattice",
+            "Fits a locally deformable 2D mesh around the detected grid. True corners snap first, then distance-weighted corner anchors guide edge-only points in the same row or column. Unanchored edges and low-detail areas stay fixed.",
         );
         ui.horizontal(|ui| {
-            drag_u32(ui, "Warp patch", &mut self.controls.warp_patch, 8..=512);
             drag_f64(
                 ui,
-                "Warp radius",
-                &mut self.controls.warp_radius,
+                "Lattice radius",
+                &mut self.controls.lattice_radius,
                 0.01..=32.0,
                 0.25,
             );
-        });
-        ui.horizontal(|ui| {
             drag_f64(
                 ui,
-                "Warp step",
-                &mut self.controls.warp_step,
+                "Lattice step",
+                &mut self.controls.lattice_step,
                 0.01..=8.0,
                 0.05,
             );
-            drag_f64(
-                ui,
-                "Warp smoothness",
-                &mut self.controls.warp_smoothness,
-                0.0..=20.0,
-                0.25,
-            );
-        });
-        checkbox_with_help(
-            ui,
-            &mut self.controls.cell_warp,
-            "Per-cell sampling warp",
-            "Refines individual mixed cells near high-contrast neighbors. Normally off because isolated shifts can add noise; enable it only for specific local misalignments. It changes sampling only, never output geometry.",
-        );
-        ui.horizontal(|ui| {
-            drag_f64(
-                ui,
-                "Cell warp radius",
-                &mut self.controls.cell_warp_radius,
-                0.01..=16.0,
-                0.25,
-            );
-            drag_f64(
-                ui,
-                "Cell warp step",
-                &mut self.controls.cell_warp_step,
-                0.01..=4.0,
-                0.05,
-            );
         });
         ui.horizontal(|ui| {
             drag_f64(
                 ui,
-                "Movement cost",
-                &mut self.controls.cell_warp_movement,
+                "Lattice regularization",
+                &mut self.controls.lattice_regularization,
                 0.0..=1.0,
-                0.001,
+                0.005,
             );
             drag_f64(
                 ui,
-                "Min improvement",
-                &mut self.controls.cell_warp_min_improvement,
-                0.0..=0.99,
+                "Edge weight",
+                &mut self.controls.lattice_edge_weight,
+                0.0..=1.0,
                 0.01,
             );
         });
         ui.horizontal(|ui| {
             drag_f64(
                 ui,
-                "Min variance",
-                &mut self.controls.cell_warp_min_variance,
+                "Min edge strength",
+                &mut self.controls.lattice_min_edge,
                 0.0..=1.0,
-                0.0001,
-            );
-            drag_f64(
-                ui,
-                "Cell contrast",
-                &mut self.controls.cell_warp_contrast,
-                0.001..=2.0,
                 0.01,
             );
+            drag_u32(
+                ui,
+                "Lattice passes",
+                &mut self.controls.lattice_iterations,
+                1..=20,
+            );
         });
-        drag_f64(
-            ui,
-            "Min contrast gain",
-            &mut self.controls.cell_warp_min_contrast_gain,
-            0.0..=2.0,
-            0.005,
-        );
     }
 
     fn palette_controls(&mut self, ui: &mut egui::Ui) {
@@ -778,14 +809,19 @@ impl PixelPusherApp {
         }
     }
 
-    fn show_canvas(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+    fn show_canvas(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        suppress_picker_click: bool,
+    ) {
         egui::Frame::new()
             .fill(Color32::from_rgb(255, 253, 247))
             .inner_margin(16.0)
             .corner_radius(14.0)
             .show(ui, |ui| {
                 if self.source.is_none() {
-                    self.show_drop_zone(ui, context);
+                    self.show_drop_zone(ui, context, suppress_picker_click);
                     return;
                 }
                 let source = self.source.as_ref().expect("source checked");
@@ -798,10 +834,14 @@ impl PixelPusherApp {
                             .small()
                             .color(Color32::from_gray(100)),
                     );
-                    if ui.small_button("Choose another…").clicked()
-                        && let Some(path) = pick_image()
+                    if ui
+                        .add_enabled(
+                            !suppress_picker_click && self.dialog_pending.is_none(),
+                            egui::Button::new("Choose another…").small(),
+                        )
+                        .clicked()
                     {
-                        self.open_image(context, path);
+                        self.begin_pick_image(context);
                     }
                 });
                 ui.add_space(6.0);
@@ -828,7 +868,7 @@ impl PixelPusherApp {
                                 });
                             ui.label(
                                 egui::RichText::new(
-                                    "100% view · red lines show recovered boundaries; cyan crosses show locally shifted samples.",
+                                    "100% view · red mesh; dark supported edges; green corner anchors; cyan color-pick overrides.",
                                 )
                                 .small()
                                 .color(Color32::from_gray(95)),
@@ -858,7 +898,12 @@ impl PixelPusherApp {
             });
     }
 
-    fn show_drop_zone(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+    fn show_drop_zone(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        suppress_picker_click: bool,
+    ) {
         let available = ui.available_size();
         let size = Vec2::new(available.x.max(300.0), available.y.max(380.0));
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -891,10 +936,8 @@ impl PixelPusherApp {
             FontId::proportional(14.0),
             Color32::from_gray(100),
         );
-        if response.clicked()
-            && let Some(path) = pick_image()
-        {
-            self.open_image(context, path);
+        if response.clicked() && !suppress_picker_click && self.dialog_pending.is_none() {
+            self.begin_pick_image(context);
         }
         if context.input(|input| !input.raw.hovered_files.is_empty()) {
             ui.painter().rect_filled(
@@ -1003,6 +1046,11 @@ impl PixelPusherApp {
                 "Palette",
                 &format!("{} colors", result.summary.palette_colors),
             );
+            metric(
+                ui,
+                "Pick overrides",
+                &result.summary.color_picker_overrides.to_string(),
+            );
             metric(ui, "PNG", &format!("{}-bit", result.summary.bit_depth));
             metric(ui, "Fit", &format!("{:.5}", result.summary.fit_score));
             metric(
@@ -1023,7 +1071,8 @@ impl eframe::App for PixelPusherApp {
         let context = ui.ctx().clone();
         ui.painter()
             .rect_filled(ui.max_rect(), 0.0, Color32::from_rgb(244, 241, 232));
-        self.handle_dropped_files(&context);
+        let dropped_file = self.handle_dropped_files(&context);
+        self.poll_dialog(&context);
         self.poll_processing(&context);
         self.show_header(ui);
         ui.add_space(8.0);
@@ -1035,7 +1084,7 @@ impl eframe::App for PixelPusherApp {
                 ui.allocate_ui_with_layout(
                     Vec2::new(canvas_width, available.y),
                     egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.show_canvas(ui, &context),
+                    |ui| self.show_canvas(ui, &context, dropped_file),
                 );
                 ui.add_space(6.0);
                 ui.allocate_ui_with_layout(
@@ -1045,7 +1094,7 @@ impl eframe::App for PixelPusherApp {
                 );
             });
         } else {
-            self.show_canvas(ui, &context);
+            self.show_canvas(ui, &context, dropped_file);
             ui.add_space(8.0);
             self.show_controls(ui, &context);
         }
@@ -1064,11 +1113,8 @@ fn process_image(
     if controls.automatic {
         command.arg("--auto");
     } else {
-        if controls.local_warp {
-            command.arg("--local-warp");
-        }
-        if controls.cell_warp {
-            command.arg("--cell-warp");
+        if controls.lattice_fit {
+            command.arg("--lattice-fit");
         }
         if controls.smart_palette {
             command.arg("--smart-palette");
@@ -1110,40 +1156,27 @@ fn process_image(
         if controls.output_block > 0 {
             append(&mut command, "--output-block", controls.output_block);
         }
-        append(&mut command, "--warp-patch", controls.warp_patch);
-        append(&mut command, "--warp-radius", controls.warp_radius);
-        append(&mut command, "--warp-step", controls.warp_step);
-        append(&mut command, "--warp-smoothness", controls.warp_smoothness);
+        append(&mut command, "--lattice-radius", controls.lattice_radius);
+        append(&mut command, "--lattice-step", controls.lattice_step);
         append(
             &mut command,
-            "--cell-warp-radius",
-            controls.cell_warp_radius,
-        );
-        append(&mut command, "--cell-warp-step", controls.cell_warp_step);
-        append(
-            &mut command,
-            "--cell-warp-movement",
-            controls.cell_warp_movement,
+            "--lattice-regularization",
+            controls.lattice_regularization,
         );
         append(
             &mut command,
-            "--cell-warp-min-improvement",
-            controls.cell_warp_min_improvement,
+            "--lattice-edge-weight",
+            controls.lattice_edge_weight,
         );
         append(
             &mut command,
-            "--cell-warp-min-variance",
-            controls.cell_warp_min_variance,
+            "--lattice-min-edge",
+            controls.lattice_min_edge,
         );
         append(
             &mut command,
-            "--cell-warp-contrast",
-            controls.cell_warp_contrast,
-        );
-        append(
-            &mut command,
-            "--cell-warp-min-contrast-gain",
-            controls.cell_warp_min_contrast_gain,
+            "--lattice-iterations",
+            controls.lattice_iterations,
         );
         append(&mut command, "--ramp-penalty", controls.ramp_penalty);
         append(&mut command, "--ramp-contrast", controls.ramp_contrast);
@@ -1282,26 +1315,13 @@ fn report_summary(report: &Value) -> Summary {
             report["output_height"].as_u64().unwrap_or_default()
         ),
         palette_colors: report["palette"].as_array().map_or(0, Vec::len),
+        color_picker_overrides: report["color_picker_overrides"]
+            .as_u64()
+            .unwrap_or_default(),
         bit_depth: report["output_bit_depth"].as_u64().unwrap_or_default(),
         fit_score: selected["score"].as_f64().unwrap_or_default(),
         perspective: !report["perspective"].is_null(),
     }
-}
-
-fn save_artifact(bytes: &[u8], filename: &str, label: &str, extensions: &[&str]) {
-    if let Some(path) = rfd::FileDialog::new()
-        .add_filter(label, extensions)
-        .set_file_name(filename)
-        .save_file()
-    {
-        let _ = std::fs::write(path, bytes);
-    }
-}
-
-fn pick_image() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
-        .pick_file()
 }
 
 fn file_label(path: &Path) -> String {
@@ -1407,38 +1427,23 @@ fn parameter_help(label: &str) -> &'static str {
         "Output block" => {
             "Square pixel size painted into the exported PNG. Use 0 for an area-preserving automatic value. Normal: 0 or 1–16; default: 0."
         }
-        "Warp patch" => {
-            "Spacing between smooth-warp control points in source pixels. Smaller patches make the warp more local but slower and less stable. Normal: 32–128; default: 64."
+        "Lattice radius" => {
+            "Maximum distance one lattice junction may move from its regular-grid seed. Normal: 1–4 source pixels; default: 2."
         }
-        "Warp radius" => {
-            "Maximum smooth-grid displacement in source pixels. Raise only when alignment visibly drifts. Normal: 0.75–3.0; default: 1.5."
+        "Lattice step" => {
+            "Subpixel increment tested around each seeded lattice junction. Smaller values improve precision but cost more work. Normal: 0.1–0.5; default: 0.25."
         }
-        "Warp step" => {
-            "Displacement increment tested by the smooth local warp. Smaller steps are more precise and slower. Normal: 0.25–1.0; default: 0.5."
+        "Lattice regularization" => {
+            "Penalty for neighboring junctions receiving different displacements. Corner anchors also guide nearer points more strongly along their row or column. Normal: 0.005–0.03; default: 0.01."
         }
-        "Warp smoothness" => {
-            "Penalty for neighboring warp controls moving differently. Higher values create gentler, more global motion. Normal: 0.75–3.0; default: 1.5."
+        "Edge weight" => {
+            "Importance of distinct local source-color boundaries in the lattice objective. Strong edges receive more influence than flat spans. Normal: 0.04–0.15; default: 0.08."
         }
-        "Cell warp radius" => {
-            "Maximum extra displacement for one mixed logical cell after smooth warping. Normal: 0.75–2.5; default: 1.5."
+        "Min edge strength" => {
+            "Minimum boundary contrast used for corner anchors and their row/column edge followers. Raise it to ignore soft detail and noise. Normal: 0.02–0.10; default: 0.04."
         }
-        "Cell warp step" => {
-            "Increment tested by the per-cell residual search. Smaller values are more precise and slower. Normal: 0.2–0.5; default: 0.25."
-        }
-        "Movement cost" => {
-            "Penalty that prevents unnecessary per-cell shifts. Raise it if samples jump toward unrelated edges. Normal: 0.003–0.015; default: 0.006."
-        }
-        "Min improvement" => {
-            "Required relative reduction in within-cell variance before accepting a shift. Higher values are more conservative. Normal: 0.10–0.30; default: 0.18."
-        }
-        "Min variance" => {
-            "Cells cleaner than this are never shifted. Raise it to limit warping to visibly mixed cells. Normal: 0.0004–0.002; default: 0.0008."
-        }
-        "Cell contrast" => {
-            "Minimum perceptual difference from a neighbor before a cell may shift toward an edge. Normal: 0.07–0.18; default: 0.10."
-        }
-        "Min contrast gain" => {
-            "Required neighbor-contrast increase after a per-cell shift. Higher values protect source fidelity. Normal: 0.005–0.03; default: 0.015."
+        "Lattice passes" => {
+            "Alternating column and row fitting passes. Later passes settle interactions between the two axes. Normal: 2–6; default: 4."
         }
         "Candidate max" => {
             "Largest fixed palette size evaluated by smart selection. Higher values preserve complex color sets but cost more work. Normal: 8–32; default: 12."
@@ -1505,11 +1510,13 @@ mod tests {
         let report = serde_json::json!({
             "selected": {"cell_width": 4.2, "cell_height": 3.8, "score": 0.1},
             "output_width": 80, "output_height": 60, "output_bit_depth": 4,
-            "palette": [[0, 0, 0], [255, 255, 255]], "perspective": null
+            "palette": [[0, 0, 0], [255, 255, 255]], "perspective": null,
+            "color_picker_overrides": 7
         });
         let summary = report_summary(&report);
         assert_eq!(summary.source_grid, "4.20 × 3.80 px");
         assert_eq!(summary.palette_colors, 2);
+        assert_eq!(summary.color_picker_overrides, 7);
         assert!(!summary.perspective);
     }
 
@@ -1526,17 +1533,12 @@ mod tests {
             "Dimension radius",
             "Complexity",
             "Output block",
-            "Warp patch",
-            "Warp radius",
-            "Warp step",
-            "Warp smoothness",
-            "Cell warp radius",
-            "Cell warp step",
-            "Movement cost",
-            "Min improvement",
-            "Min variance",
-            "Cell contrast",
-            "Min contrast gain",
+            "Lattice radius",
+            "Lattice step",
+            "Lattice regularization",
+            "Edge weight",
+            "Min edge strength",
+            "Lattice passes",
             "Candidate max",
             "Merge radius",
             "Palette penalty",

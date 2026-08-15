@@ -15,7 +15,7 @@ pub struct CellColor {
 // unweighted squared distance still lets the many lightness steps common in
 // generated pixel art dominate a small warm/cool accent. A modest chroma-axis
 // emphasis keeps those hue branches competitive without changing the grid,
-// warp, ramp, or output-metric distance functions.
+// lattice, ramp, or output-metric distance functions.
 const PALETTE_CHROMA_WEIGHT: f64 = 2.0;
 
 fn palette_distance_squared(a: [f64; 3], b: [f64; 3]) -> f64 {
