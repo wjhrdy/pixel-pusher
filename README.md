@@ -6,6 +6,46 @@ It searches logical-pixel widths, heights, and grid phases independently, includ
 
 The output is always rendered onto a new, rigid lattice of exact square pixels. Fractional squeeze, perspective correction, and optional non-uniform source-lattice fitting affect source sampling only; they never produce subpixels or irregular boundaries in the result.
 
+## Examples
+
+Each row shows the source image, Pixel Pusher's edge detection and fitted lattice, and the reconstructed square-pixel output. In the diagnostic view, red is the complete mesh, dark segments are locally supported boundaries, green squares are high-confidence corner anchors, and cyan crosses mark color-sampling overrides.
+
+<table>
+  <thead>
+    <tr>
+      <th>Input</th>
+      <th>Edge detection + lattice fit</th>
+      <th>Output</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/examples/burger-input.png" alt="AI-generated pixel-art hamburger input" width="280"></td>
+      <td><img src="docs/examples/burger-lattice.png" alt="Detected edges and fitted lattice over the hamburger" width="280"></td>
+      <td><img src="docs/examples/burger-output.png" alt="Aligned hamburger output" width="280"></td>
+    </tr>
+    <tr>
+      <td colspan="3"><sub>Hamburger — recovered source grid: 17.3 × 17.0 px; rigid output grid: 17 px.</sub></td>
+    </tr>
+    <tr>
+      <td><img src="docs/examples/butterfly-input.png" alt="AI-generated pixel-art butterfly input" width="280"></td>
+      <td><img src="docs/examples/butterfly-lattice.png" alt="Detected edges and fitted lattice over the butterfly" width="280"></td>
+      <td><img src="docs/examples/butterfly-output.png" alt="Aligned butterfly output" width="280"></td>
+    </tr>
+    <tr>
+      <td colspan="3"><sub>Butterfly — recovered source grid: 16.8 × 17.0 px; rigid output grid: 17 px.</sub></td>
+    </tr>
+    <tr>
+      <td><img src="docs/examples/pastry-input.png" alt="AI-generated pixel-art pastry and lemon input" width="280"></td>
+      <td><img src="docs/examples/pastry-lattice.png" alt="Detected edges and fitted lattice over the pastry and lemon" width="280"></td>
+      <td><img src="docs/examples/pastry-output.png" alt="Aligned pastry and lemon output" width="280"></td>
+    </tr>
+    <tr>
+      <td colspan="3"><sub>Pastry and lemon — recovered source grid: 20.4 × 20.3 px; rigid output grid: 20 px.</sub></td>
+    </tr>
+  </tbody>
+</table>
+
 ## Features
 
 - Automatic logical-pixel scale, x/y phase, fractional squeeze, clustered-line lattice initialization, edge-gated local fitting, palette, and output-scale selection
